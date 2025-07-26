@@ -12,6 +12,10 @@
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
+#define USE_EXPORT_NAME             1
+
+#define GET_ALL_KIND_PROTOTYPE      1
+
 #ifdef USE_RDTSC
     #include "rdtsc.h"
     static inline uint64_t
@@ -245,6 +249,62 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     return path;
 }
 
+/*
+获取所有类型的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
+如果没有正确获取 prototype，那么像 tonumber 和 print 这类 LUA_VLCF 使用栈上的函数指针来充当 prototype,
+会导致同一层的这类函数被合并为同一个节点，比如下面的代码，最终 print 会错误的合并到 tonumber 的节点中，显示为
+2 次 tonumber 调用。 
+
+验证代码:
+local function test1()
+    local profile = require "profile"
+    local json = require "cjson"
+    profile.start()
+    tonumber("123")    
+    print("111")
+    local result = profile.stop()
+    skynet.error("test1:", json.encode(result))
+end
+test1()
+
+结果可用 https://jsongrid.com/ 查看
+*/
+static void*
+_get_all_kind_prototype(lua_State* L, lua_Debug* far) {
+    void* prototype = NULL;
+    if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
+        Closure *cl = clvalue(s2v(far->i_ci->func));
+        if (cl) {
+            if (cl->c.tt == LUA_VLCL) {
+                prototype = cl->l.p;
+            } else if (cl->c.tt == LUA_VCCL) {
+                prototype = (void*)cl->c.f;
+            }
+        }
+    } 
+    // 通常 LUA_VLCF 可以用下面方式成功获取
+    if (!prototype) {
+        lua_getinfo(L, "f", far); 
+        prototype = lua_topointer(L, -1); 
+        printf("get prototype by getinfo, prototype = %p\n", prototype);
+        if (!prototype) {
+            printf("get prototype fail at last\n");
+        }        
+    }
+    return prototype;
+}
+
+static void*
+_only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
+    if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
+        Closure *cl = clvalue(s2v(far->i_ci->func));
+        if (cl && cl->c.tt == LUA_VLCL) {
+            return cl->l.p;
+        }
+    } 
+    return NULL;
+}
+
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     struct profile_context* context = ((struct snlua*)ud)->context;
@@ -308,6 +368,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         } else {
             lua_getinfo(L, "f", far);
             point = lua_topointer(L, -1);
+            printf("get point by getinfo, point = %p\n", point);
         }
 
         struct icallpath_context* pre_callpath = NULL;
@@ -323,12 +384,16 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->call_time = cur_time;
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
-        frame->prototype = point;
-        if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
-            Closure *cl = clvalue(s2v(far->i_ci->func));
-            if (cl && cl->c.tt == LUA_VLCL) {
-                frame->prototype = cl->l.p;
-            }
+        void* prototype = NULL;
+#ifdef GET_ALL_KIND_PROTOTYPE
+        prototype = _get_all_kind_prototype(L, far);
+#else   
+        prototype = _only_get_vlcl_prototype(L, far);
+#endif
+        if (prototype) { 
+            frame->prototype = prototype;
+        } else {
+            frame->prototype = point;
         }
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
