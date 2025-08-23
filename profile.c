@@ -15,6 +15,16 @@
 #define USE_EXPORT_NAME             1
 
 #define GET_ALL_KIND_PROTOTYPE      1
+#if defined(LUA_VERSION_NUM) && (LUA_VERSION_NUM >= 504)
+#define GET_CI_FUNC_TVALUE(ar)       (s2v((ar)->i_ci->func.p))
+#define HAS_CI_FUNC(ar)              ((ar)->i_ci)
+#define GET_CI_FUNC_STACKPTR(ar)     ((ar)->i_ci->func.p)
+#else
+#define GET_CI_FUNC_TVALUE(ar)       (s2v((ar)->i_ci->func))
+#define HAS_CI_FUNC(ar)              ((ar)->i_ci && (ar)->i_ci->func)
+#define GET_CI_FUNC_STACKPTR(ar)     ((ar)->i_ci->func)
+#endif
+
 
 #ifdef USE_RDTSC
     #include "rdtsc.h"
@@ -269,11 +279,11 @@ test1()
 
 结果可用 https://jsongrid.com/ 查看
 */
-static void*
+static const void*
 _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
-    void* prototype = NULL;
-    if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
-        Closure *cl = clvalue(s2v(far->i_ci->func));
+    const void* prototype = NULL;
+    if (HAS_CI_FUNC(far) && ttisclosure(GET_CI_FUNC_TVALUE(far))) {
+        Closure *cl = clvalue(GET_CI_FUNC_TVALUE(far));
         if (cl) {
             if (cl->c.tt == LUA_VLCL) {
                 prototype = cl->l.p;
@@ -294,16 +304,18 @@ _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
     return prototype;
 }
 
-static void*
+#ifndef GET_ALL_KIND_PROTOTYPE
+static const void*
 _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
-    if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
-        Closure *cl = clvalue(s2v(far->i_ci->func));
+    if (HAS_CI_FUNC(far) && ttisclosure(GET_CI_FUNC_TVALUE(far))) {
+        Closure *cl = clvalue(GET_CI_FUNC_TVALUE(far));
         if (cl && cl->c.tt == LUA_VLCL) {
             return cl->l.p;
         }
     } 
     return NULL;
 }
+#endif
 
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
@@ -363,12 +375,13 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
         const void* point = NULL;
-        if (far->i_ci && far->i_ci->func) {
-            point = far->i_ci->func;
+        if (HAS_CI_FUNC(far)) {
+            point = GET_CI_FUNC_STACKPTR(far);
         } else {
             lua_getinfo(L, "f", far);
             point = lua_topointer(L, -1);
             printf("get point by getinfo, point = %p\n", point);
+            lua_pop(L, 1);
         }
 
         struct icallpath_context* pre_callpath = NULL;
@@ -384,7 +397,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->call_time = cur_time;
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
-        void* prototype = NULL;
+        const void* prototype = NULL;
 #ifdef GET_ALL_KIND_PROTOTYPE
         prototype = _get_all_kind_prototype(L, far);
 #else   
