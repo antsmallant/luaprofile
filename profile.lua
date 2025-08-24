@@ -1,4 +1,4 @@
-local c = require "profile.c"
+local c = require "luaprofile"
 
 local M = {
 }

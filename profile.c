@@ -606,7 +606,7 @@ _ldump(lua_State* L) {
 }
 
 int
-luaopen_profile_c(lua_State* L) {
+luaopen_luaprofile(lua_State* L) {
     luaL_checkversion(L);
      luaL_Reg l[] = {
         {"start", _lstart},
