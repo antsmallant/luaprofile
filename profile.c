@@ -1,3 +1,5 @@
+// This file is modified version from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile
+
 #include "profile.h"
 #include "imap.h"
 #include "icallpath.h"
@@ -11,41 +13,33 @@
 #define MAX_CO_SIZE                 1024
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
-
 #define USE_EXPORT_NAME             1
-
 #define GET_ALL_KIND_PROTOTYPE      1
 
-#ifdef USE_RDTSC
-    #include "rdtsc.h"
-    static inline uint64_t
-    gettime() {
-        return rdtsc();
-    }
+static char profile_started_key = 'x';
 
-    static inline double
-    realtime(uint64_t t) {
-        return (double) t / (2000000000);
-    }
-#else
-    static inline uint64_t
-    gettime() {
-        struct timespec ti;
-        // clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ti);
-        // clock_gettime(CLOCK_MONOTONIC, &ti);  
-        clock_gettime(CLOCK_REALTIME, &ti);  // would be faster
+struct profile_context;
 
-        long sec = ti.tv_sec & 0xffff;
-        long nsec = ti.tv_nsec;
+struct profile_context* g_context = NULL;
 
-        return sec * NANOSEC + nsec;
-    }
 
-    static inline double
-    realtime(uint64_t t) {
-        return (double)t / NANOSEC;
-    }
-#endif
+static inline uint64_t
+gettime() {
+    struct timespec ti;
+    // clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ti);
+    // clock_gettime(CLOCK_MONOTONIC, &ti);  
+    clock_gettime(CLOCK_REALTIME, &ti);  // would be faster
+
+    long sec = ti.tv_sec & 0xffff;
+    long nsec = ti.tv_nsec;
+
+    return sec * NANOSEC + nsec;
+}
+
+static inline double
+realtime(uint64_t t) {
+    return (double)t / NANOSEC;
+}
 
 
 struct callpath_node;
@@ -141,7 +135,6 @@ profile_free(struct profile_context* context) {
     pfree(context);
 }
 
-
 static inline struct call_frame *
 push_callframe(struct call_state* cs) {
     if(cs->top >= MAX_CALL_SIZE) {
@@ -168,15 +161,11 @@ cur_callframe(struct call_state* cs) {
     return &cs->call_list[idx];
 }
 
-struct snlua {
-    struct profile_context * context;
-};
-
 static inline struct profile_context *
 _get_profile(lua_State* L) {
     void *ud = NULL;
     lua_getallocf(L, &ud);
-    return ((struct snlua*)(ud))->context;
+    return ud;
 }
 
 static struct icallpath_context*
@@ -249,6 +238,18 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     return path;
 }
 
+static void*
+_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    struct profile_context* context = (struct profile_context*)ud;
+    size_t old = ptr == NULL ? 0 : osize;
+    if (nsize > 0 && nsize > old && context->increment_alloc_count) {
+        context->alloc_count += (nsize - old);
+    }
+
+    void* p = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    return p;
+}
+
 /*
 获取所有类型的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
 如果没有正确获取 prototype，那么像 tonumber 和 print 这类 LUA_VLCF 使用栈上的函数指针来充当 prototype,
@@ -307,18 +308,6 @@ _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
 }
 #endif
 
-static void*
-_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
-    struct profile_context* context = ((struct snlua*)ud)->context;
-    size_t old = ptr == NULL ? 0 : osize;
-    if (nsize > 0 && nsize > old && context->increment_alloc_count) {
-        context->alloc_count += (nsize - old);
-    }
-
-    void* p = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
-    return p;
-}
-
 static void
 _resolve_hook(lua_State* L, lua_Debug* far) {
     struct profile_context* context = _get_profile(L);
@@ -370,7 +359,6 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         } else {
             lua_getinfo(L, "f", far);
             point = lua_topointer(L, -1);
-            printf("get point by getinfo, point = %p\n", point);
         }
 
         struct icallpath_context* pre_callpath = NULL;
@@ -396,7 +384,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
             frame->prototype = prototype;
         } else {
             frame->prototype = point;
-        }
+        }        
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
@@ -515,21 +503,41 @@ get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
     return i;
 }
 
+static bool chk_profile_started(lua_State* L) {
+    // 检查是否已经启动
+    lua_pushlightuserdata(L, &profile_started_key);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+    if (lua_toboolean(L, -1)) {
+        lua_pop(L, 1);
+        return true;
+    }
+    lua_pop(L, 1);  
+    return false;  
+}
+
+static void set_profile_started(lua_State* L) {
+    lua_pushlightuserdata(L, &profile_started_key);
+    lua_pushboolean(L, 1);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
+static void unset_profile_started(lua_State* L) {
+    lua_pushlightuserdata(L, &profile_started_key);
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
 static int
 _lstart(lua_State* L) {
-    struct profile_context* context = _get_profile(L);
-    if (context) {
+    if (chk_profile_started(L)) {
+        printf("start fail, profile already started\n");
         return 0;
     }
-    // ProfilerStart("my.prof");
-    // init registry
-    context = profile_create();
-
+    set_profile_started(L);
+    struct profile_context* context = profile_create();
     context->start = gettime();
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    ((struct snlua*)(context->last_alloc_ud))->context = context;
-    lua_setallocf(L, _resolve_alloc, context->last_alloc_ud);
-
+    lua_setallocf(L, _resolve_alloc, context);
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
@@ -541,24 +549,24 @@ _lstart(lua_State* L) {
 
 static int
 _lstop(lua_State* L) {
+    if (!chk_profile_started(L)) {
+        printf("stop fail, profile not started\n");
+        return 0;
+    }
     struct profile_context* context = _get_profile(L);
     if (!context) {
         return 0;
     }
     context->increment_alloc_count = false;
-    //ProfilerStop();
-
-    void* current_ud = NULL;
-    lua_getallocf(L, &current_ud);
-     ((struct snlua*)(current_ud))->context = NULL;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
-
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
         lua_sethook(states[i], NULL, 0, 0);
     }
     profile_free(context);
+    context = NULL;
+    unset_profile_started(L);
     return 0;
 }
 
