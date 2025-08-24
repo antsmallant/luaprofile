@@ -272,8 +272,8 @@ test1()
 static void*
 _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
     void* prototype = NULL;
-    if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
-        Closure *cl = clvalue(s2v(far->i_ci->func));
+    if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
+        Closure *cl = clvalue(s2v(far->i_ci->func.p));
         if (cl) {
             if (cl->c.tt == LUA_VLCL) {
                 prototype = cl->l.p;
@@ -296,8 +296,8 @@ _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
 
 static void*
 _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
-    if (far->i_ci && ttisclosure(s2v(far->i_ci->func))) {
-        Closure *cl = clvalue(s2v(far->i_ci->func));
+    if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
+        Closure *cl = clvalue(s2v(far->i_ci->func.p));
         if (cl && cl->c.tt == LUA_VLCL) {
             return cl->l.p;
         }
@@ -363,8 +363,8 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
         const void* point = NULL;
-        if (far->i_ci && far->i_ci->func) {
-            point = far->i_ci->func;
+        if (far->i_ci && far->i_ci->func.p) {
+            point = far->i_ci->func.p;
         } else {
             lua_getinfo(L, "f", far);
             point = lua_topointer(L, -1);
