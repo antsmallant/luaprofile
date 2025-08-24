@@ -294,6 +294,7 @@ _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
     return prototype;
 }
 
+#ifndef GET_ALL_KIND_PROTOTYPE
 static void*
 _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
     if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
@@ -304,6 +305,7 @@ _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
     } 
     return NULL;
 }
+#endif
 
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
