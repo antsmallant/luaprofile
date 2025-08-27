@@ -20,8 +20,6 @@ static char profile_started_key = 'x';
 
 struct profile_context;
 
-struct profile_context* g_context = NULL;
-
 
 static inline uint64_t
 gettime() {
