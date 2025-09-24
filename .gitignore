@@ -7,3 +7,5 @@ old_profile.lua
 test.lua
 *.dSYM
 build/
+.cache/
+compile_commands.json
