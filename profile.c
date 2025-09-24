@@ -268,16 +268,16 @@ test1()
 
 结果可用 https://jsongrid.com/ 查看
 */
-static void*
+static const void*
 _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
-    void* prototype = NULL;
+    const void* prototype = NULL;
     if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
         Closure *cl = clvalue(s2v(far->i_ci->func.p));
         if (cl) {
             if (cl->c.tt == LUA_VLCL) {
-                prototype = cl->l.p;
+                prototype = (const void*)cl->l.p;
             } else if (cl->c.tt == LUA_VCCL) {
-                prototype = (void*)cl->c.f;
+                prototype = (const void*)cl->c.f;
             }
         }
     } 
@@ -285,7 +285,7 @@ _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
     if (!prototype) {
         lua_getinfo(L, "f", far); 
         prototype = lua_topointer(L, -1); 
-        printf("get prototype by getinfo, prototype = %p\n", prototype);
+        //printf("get prototype by getinfo, prototype = %p\n", prototype);
         if (!prototype) {
             printf("get prototype fail at last\n");
         }        
@@ -294,12 +294,12 @@ _get_all_kind_prototype(lua_State* L, lua_Debug* far) {
 }
 
 #ifndef GET_ALL_KIND_PROTOTYPE
-static void*
+static const void*
 _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
     if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
         Closure *cl = clvalue(s2v(far->i_ci->func.p));
         if (cl && cl->c.tt == LUA_VLCL) {
-            return cl->l.p;
+            return (const void*)cl->l.p;
         }
     } 
     return NULL;
@@ -372,7 +372,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->call_time = cur_time;
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
-        void* prototype = NULL;
+        const void* prototype = NULL;
 #ifdef GET_ALL_KIND_PROTOTYPE
         prototype = _get_all_kind_prototype(L, far);
 #else   

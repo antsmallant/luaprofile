@@ -3,7 +3,7 @@
 all: linux
 
 linux:
-	gcc -shared -fPIC -Wall -g -O2 -DUSE_EXPORT_NAME \
+	gcc -shared -fPIC -Wall -g -O2 \
 		-Ibuild/lua-5.4.8/src \
 		-o luaprofilec.so \
 		imap.c profile.c icallpath.c
