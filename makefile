@@ -1,5 +1,6 @@
+.PHONY : all clean macosx linux
 
-all: macosx
+all: linux
 
 macosx:
 	clang -undefined dynamic_lookup --shared -Wall -DUSE_RDTSC -g -O2 \
@@ -7,11 +8,9 @@ macosx:
 		imap.c profile.c
 
 linux:
-	gcc -shared -fPIC -Wall -g -O2 -DUSE_RDTSC \
+	gcc -shared -fPIC -Wall -g -O2 -Ibuild/lua-5.4.8/src \
 		-o luaprofilec.so \
-		imap.c profile.c
+		imap.c profile.c icallpath.c
 
 clean:
 	rm -rf luaprofilec.so
-
-.PHONY : all clean macosx linux
