@@ -567,11 +567,15 @@ _lstop(lua_State* L) {
     context->increment_alloc_count = false;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
     lua_State* states[MAX_CO_SIZE] = {0};
+    // stop gc before unset hook
+    int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
+    if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }    
     int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
     int i;
     for (i = sz - 1; i >= 0; i--) {
         lua_sethook(states[i], NULL, 0, 0);
     }
+    if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
     profile_free(context);
     context = NULL;
     unset_profile_started(L);
