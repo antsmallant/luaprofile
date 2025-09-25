@@ -166,6 +166,30 @@ _get_profile(lua_State* L) {
     return ud;
 }
 
+static bool chk_profile_started(lua_State* L) {
+    // 检查是否已经启动
+    lua_pushlightuserdata(L, &profile_started_key);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+    if (lua_toboolean(L, -1)) {
+        lua_pop(L, 1);
+        return true;
+    }
+    lua_pop(L, 1);  
+    return false;  
+}
+
+static void set_profile_started(lua_State* L) {
+    lua_pushlightuserdata(L, &profile_started_key);
+    lua_pushboolean(L, 1);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
+static void unset_profile_started(lua_State* L) {
+    lua_pushlightuserdata(L, &profile_started_key);
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
 static struct icallpath_context*
 get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, struct icallpath_context* pre_callpath, struct call_frame* frame) {
     if (!context->callpath) {
@@ -237,7 +261,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
 }
 
 static void*
-_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
     size_t old = ptr == NULL ? 0 : osize;
     if (nsize > 0 && nsize > old && context->increment_alloc_count) {
@@ -308,6 +332,10 @@ _only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
 
 static void
 _resolve_hook(lua_State* L, lua_Debug* far) {
+    if (!chk_profile_started(L)) {
+        printf("resolve hook fail, profile not started\n");
+        return;
+    }
     struct profile_context* context = _get_profile(L);
     if(context->start == 0) {
         return;
@@ -501,30 +529,6 @@ get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
     return i;
 }
 
-static bool chk_profile_started(lua_State* L) {
-    // 检查是否已经启动
-    lua_pushlightuserdata(L, &profile_started_key);
-    lua_rawget(L, LUA_REGISTRYINDEX);
-    if (lua_toboolean(L, -1)) {
-        lua_pop(L, 1);
-        return true;
-    }
-    lua_pop(L, 1);  
-    return false;  
-}
-
-static void set_profile_started(lua_State* L) {
-    lua_pushlightuserdata(L, &profile_started_key);
-    lua_pushboolean(L, 1);
-    lua_rawset(L, LUA_REGISTRYINDEX);
-}
-
-static void unset_profile_started(lua_State* L) {
-    lua_pushlightuserdata(L, &profile_started_key);
-    lua_pushnil(L);
-    lua_rawset(L, LUA_REGISTRYINDEX);
-}
-
 static int
 _lstart(lua_State* L) {
     if (chk_profile_started(L)) {
@@ -542,7 +546,7 @@ _lstart(lua_State* L) {
         lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
     context->increment_alloc_count = true;
-    printf("luaprofile started\n");
+    printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);
     return 0;
 }
 
@@ -559,8 +563,9 @@ _lstop(lua_State* L) {
     context->increment_alloc_count = false;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
     lua_State* states[MAX_CO_SIZE] = {0};
-    int i = get_all_coroutines(L, states, MAX_CO_SIZE);
-    for (i = i - 1; i >= 0; i--) {
+    int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
+    int i;
+    for (i = sz - 1; i >= 0; i--) {
         lua_sethook(states[i], NULL, 0, 0);
     }
     profile_free(context);
@@ -572,6 +577,10 @@ _lstop(lua_State* L) {
 
 static int
 _lmark(lua_State* L) {
+    if (!chk_profile_started(L)) {
+        printf("mark fail, profile not started\n");
+        return 0;
+    }
     struct profile_context* context = _get_profile(L);
     if (!context) {
         return 0;
@@ -589,6 +598,10 @@ _lmark(lua_State* L) {
 
 static int
 _lunmark(lua_State* L) {
+    if (!chk_profile_started(L)) {
+        printf("unmark fail, profile not started\n");
+        return 0;
+    }    
     struct profile_context* context = _get_profile(L);
     if (!context) {
         return 0;
