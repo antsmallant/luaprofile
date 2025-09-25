@@ -541,10 +541,14 @@ _lstart(lua_State* L) {
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     lua_setallocf(L, _resolve_alloc, context);
     lua_State* states[MAX_CO_SIZE] = {0};
+    // stop gc before set hook
+    int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
+    if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
         lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
+    if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
     context->increment_alloc_count = true;
     printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);
     return 0;
