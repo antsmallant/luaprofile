@@ -69,6 +69,7 @@ struct profile_context {
     lua_Alloc   last_alloc_f;
     void*       last_alloc_ud;
     struct imap_context*        cs_map;
+    struct imap_context*        alloc_map;
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
 };
@@ -84,6 +85,11 @@ struct callpath_node {
     uint64_t count;
     uint64_t record_time;
     uint64_t alloc_count;
+};
+
+struct alloc_node {
+    struct callpath_node* path;
+    uint64_t alloc_size;
 };
 
 static struct callpath_node*
@@ -102,12 +108,21 @@ callpath_node_create() {
     return node;
 }
 
+static struct alloc_node*
+alloc_node_create() {
+    struct alloc_node* node = (struct alloc_node*)pmalloc(sizeof(*node));
+    node->path = NULL;
+    node->alloc_size = 0;
+    return node;
+}
+
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
     
     context->start = 0;
     context->cs_map = imap_create();
+    context->alloc_map = imap_create();
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->increment_alloc_count = false;
@@ -268,8 +283,8 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         context->alloc_count += (nsize - old);
     }
 
-    void* p = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
-    return p;
+    void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    return alloc_ret;
 }
 
 /*
