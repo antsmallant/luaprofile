@@ -20,6 +20,17 @@ static char profile_started_key = 'x';
 
 struct profile_context;
 
+/*
+callpath 是棵树，每个frame可以在这个树中找到一个节点node，从前 framestack 从根到 cur frame, 对应到这棵树的一条路径。  
+prototype 是 callpath node 的 key，一个新的 frame 要找到对应的 callpath node，就用 prototype 从上一个 frame 的 node 里面查找 child node，找不到则创建。  
+同样 prototype 的函数，可能会在 callpath tree 有多个 node，这取决于它的父亲是谁。  
+
+node1
+  node21
+    node31
+对应着 frame1 -> frame2 -> frame3 的调用关系。 
+*/
+
 
 static inline uint64_t
 gettime() {
