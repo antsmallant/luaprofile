@@ -75,8 +75,10 @@ struct call_state {
 
 struct profile_context {
     uint64_t    start;
-    bool        increment_alloc_count;
+    bool        running_in_hook;  // 是否正在运行 hook 逻辑
     uint64_t    alloc_count;
+    uint64_t    free_count;
+    uint64_t    realloc_count;
     lua_Alloc   last_alloc_f;
     void*       last_alloc_ud;
     struct imap_context*        cs_map;
@@ -136,8 +138,10 @@ profile_create() {
     context->alloc_map = imap_create();
     context->callpath = NULL;
     context->cur_cs = NULL;
-    context->increment_alloc_count = false;
+    context->running_in_hook = false;
     context->alloc_count = 0;
+    context->free_count = 0;
+    context->realloc_count = 0;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     return context;
@@ -289,12 +293,25 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
-    size_t old = ptr == NULL ? 0 : osize;
-    if (nsize > 0 && nsize > old && context->increment_alloc_count) {
-        context->alloc_count += (nsize - old);
+    void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    if (context->running_in_hook) {
+        return alloc_ret;
     }
 
-    void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    size_t old = ptr == NULL ? 0 : osize;
+    if (nsize > 0 && nsize > old) {
+        context->alloc_count += (nsize - old);
+    }    
+
+    // free
+    if (ptr && osize == 0 && nsize == 0) {
+        context->alloc_map->
+    }
+
+    // alloc
+
+    // realloc
+
     return alloc_ret;
 }
 
@@ -368,7 +385,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
     }
 
     uint64_t cur_time = gettime();
-    context->increment_alloc_count = false;
+    context->running_in_hook = true;
     int event = far->event;
     struct call_state* cs = context->cur_cs;
     if (!context->cur_cs || context->cur_cs->co != L) {
@@ -441,7 +458,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
         if (len <= 0) {
-            context->increment_alloc_count = true;
+            context->running_in_hook = false;
             return;
         }
         bool tail_call = false;
@@ -466,7 +483,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         }while(tail_call);
     }
 
-    context->increment_alloc_count = true;
+    context->running_in_hook = false;
 }
 
 
@@ -564,6 +581,7 @@ _lstart(lua_State* L) {
     set_profile_started(L);
     struct profile_context* context = profile_create();
     context->start = gettime();
+    context->running_in_hook = true;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     lua_setallocf(L, _resolve_alloc, context);
     lua_State* states[MAX_CO_SIZE] = {0};
@@ -575,8 +593,8 @@ _lstart(lua_State* L) {
         lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
-    context->increment_alloc_count = true;
     printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);
+    context->running_in_hook = false;
     return 0;
 }
 
@@ -590,7 +608,7 @@ _lstop(lua_State* L) {
     if (!context) {
         return 0;
     }
-    context->increment_alloc_count = false;
+    context->running_in_hook = true;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
     lua_State* states[MAX_CO_SIZE] = {0};
     // stop gc before unset hook
@@ -652,11 +670,11 @@ static int
 _ldump(lua_State* L) {
     struct profile_context* context = _get_profile(L);
     if (context && context->callpath) {
-        context->increment_alloc_count = false;
+        context->running_in_hook = true;
         uint64_t record_time = realtime(gettime() - context->start) * MICROSEC;
         lua_pushinteger(L, record_time);
         dump_call_path(L, context->callpath);
-        context->increment_alloc_count = true;
+        context->running_in_hook = false;
         return 2;
     }
     return 0;
