@@ -13,7 +13,7 @@ local function test3()
 end
 
 local function test2()
-    for i = 1, 10 do
+    for i = 1, 100 do
         test3()
     end    
 end

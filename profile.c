@@ -304,9 +304,6 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     }    
 
     // free
-    if (ptr && osize == 0 && nsize == 0) {
-        context->alloc_map->
-    }
 
     // alloc
 
