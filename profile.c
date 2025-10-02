@@ -38,10 +38,8 @@ gettime() {
     // clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ti);
     // clock_gettime(CLOCK_MONOTONIC, &ti);  
     clock_gettime(CLOCK_REALTIME, &ti);  // would be faster
-
     long sec = ti.tv_sec & 0xffff;
     long nsec = ti.tv_nsec;
-
     return sec * NANOSEC + nsec;
 }
 
@@ -53,7 +51,6 @@ realtime(uint64_t t) {
 
 struct callpath_node;
 struct call_frame {
-    const void* point;
     const void* prototype;
     struct icallpath_context*   path;
     bool  tail;
@@ -89,7 +86,6 @@ struct profile_context {
 
 struct callpath_node {
     struct callpath_node*   parent;
-    const void* point;
     const char* source;
     const char* name;
     int     line;
@@ -109,7 +105,6 @@ static struct callpath_node*
 callpath_node_create() {
     struct callpath_node* node = (struct callpath_node*)pmalloc(sizeof(*node));
     node->parent = NULL;
-    node->point = NULL;
     node->source = NULL;
     node->name = NULL;
     node->line = 0;
@@ -242,7 +237,6 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         struct callpath_node* node = callpath_node_create();
 
         node->parent = path_parent;
-        node->point = cur_cf->prototype;
         node->depth = path_parent->depth + 1;
         node->ret_time = 0;
         node->record_time = 0;
@@ -336,18 +330,18 @@ test1()
 static const void* _get_all_kind_prototype(lua_State* L, lua_Debug* ar) {
     const void* proto = NULL;
     if (ar->i_ci && ar->i_ci->func.p) {
-    const TValue* tv = s2v(ar->i_ci->func.p);
-    if (ttislcf(tv)) {
-        // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
-        proto = (const void*)fvalue(tv);
-    } else if (ttisclosure(tv)) {
-        const Closure* cl = clvalue(tv);
-        if (cl->c.tt == LUA_VLCL) {
-            proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
-        } else if (cl->c.tt == LUA_VCCL) {
-            proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
+        const TValue* tv = s2v(ar->i_ci->func.p);
+        if (ttislcf(tv)) {
+            // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
+            proto = (const void*)fvalue(tv);
+        } else if (ttisclosure(tv)) {
+            const Closure* cl = clvalue(tv);
+            if (cl->c.tt == LUA_VLCL) {
+                proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
+            } else if (cl->c.tt == LUA_VCCL) {
+                proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
+            }
         }
-    }
     }
     if (!proto) {
         // 兜底：仍可能遇到少数拿不到 TValue 的情况
@@ -357,19 +351,6 @@ static const void* _get_all_kind_prototype(lua_State* L, lua_Debug* ar) {
     }
     return proto;
 }
-
-#ifndef GET_ALL_KIND_PROTOTYPE
-static const void*
-_only_get_vlcl_prototype(lua_State* L, lua_Debug* far) {
-    if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
-        Closure *cl = clvalue(s2v(far->i_ci->func.p));
-        if (cl && cl->c.tt == LUA_VLCL) {
-            return (const void*)cl->l.p;
-        }
-    } 
-    return NULL;
-}
-#endif
 
 static void
 _resolve_hook(lua_State* L, lua_Debug* far) {
@@ -420,39 +401,18 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
     assert(cs->co == L);
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
-        const void* point = NULL;
-        if (far->i_ci && far->i_ci->func.p) {
-            point = far->i_ci->func.p;
-        } else {
-            lua_getinfo(L, "f", far);
-            point = lua_topointer(L, -1);
-            lua_pop(L, 1);
-        }
-
         struct icallpath_context* pre_callpath = NULL;
         struct call_frame* pre_frame = cur_callframe(cs);
         if (pre_frame) {
             pre_callpath = pre_frame->path;
         }
-
         struct call_frame* frame = push_callframe(cs);
-        frame->point = point;
-        frame->tail = event == LUA_HOOKTAILCALL;
+        frame->tail = (event == LUA_HOOKTAILCALL);
         frame->sub_cost = 0;
         frame->call_time = cur_time;
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
-        const void* prototype = NULL;
-#ifdef GET_ALL_KIND_PROTOTYPE
-        prototype = _get_all_kind_prototype(L, far);
-#else   
-        prototype = _only_get_vlcl_prototype(L, far);
-#endif
-        if (prototype) { 
-            frame->prototype = prototype;
-        } else {
-            frame->prototype = point;
-        }        
+        frame->prototype = _get_all_kind_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
