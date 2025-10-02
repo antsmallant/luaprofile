@@ -18,6 +18,15 @@ local function test2()
     end    
 end
 
+-- 触发 LUA_VCCL：string.gmatch 返回 C 闭包迭代器（带 upvalues）
+local function test_vccl()
+    local acc = 0
+    for w in string.gmatch("foo bar baz", "%S+") do
+        acc = acc + #w
+    end
+    return acc
+end
+
 local function test1()
     profile.start()
     tonumber("123")    
@@ -25,6 +34,7 @@ local function test1()
     tonumber("234")
     print("222")
     test2()
+    test_vccl()
     local result = profile.stop()
     local strResult = json.encode(result)
     print(strResult)

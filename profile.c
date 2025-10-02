@@ -74,7 +74,7 @@ struct call_state {
 };
 
 struct profile_context {
-    uint64_t    start;
+    uint64_t    start_time;
     bool        running_in_hook;  // 是否正在运行 hook 逻辑
     uint64_t    alloc_count;
     uint64_t    free_count;
@@ -133,7 +133,7 @@ static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
     
-    context->start = 0;
+    context->start_time = 0;
     context->cs_map = imap_create();
     context->alloc_map = imap_create();
     context->callpath = NULL;
@@ -151,6 +151,7 @@ static void
 _ob_free_call_state(uint64_t key, void* value, void* ud) {
     pfree(value);
 }
+
 static void
 profile_free(struct profile_context* context) {
     if (context->callpath) {
@@ -332,29 +333,29 @@ test1()
 
 结果可用 https://jsongrid.com/ 查看
 */
-static const void*
-_get_all_kind_prototype(lua_State* L, lua_Debug* far) {
-    const void* prototype = NULL;
-    if (far->i_ci && far->i_ci->func.p && ttisclosure(s2v(far->i_ci->func.p))) {
-        Closure *cl = clvalue(s2v(far->i_ci->func.p));
-        if (cl) {
-            if (cl->c.tt == LUA_VLCL) {
-                prototype = (const void*)cl->l.p;
-            } else if (cl->c.tt == LUA_VCCL) {
-                prototype = (const void*)cl->c.f;
-            }
+static const void* _get_all_kind_prototype(lua_State* L, lua_Debug* ar) {
+    const void* proto = NULL;
+    if (ar->i_ci && ar->i_ci->func.p) {
+    const TValue* tv = s2v(ar->i_ci->func.p);
+    if (ttislcf(tv)) {
+        // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
+        proto = (const void*)fvalue(tv);
+    } else if (ttisclosure(tv)) {
+        const Closure* cl = clvalue(tv);
+        if (cl->c.tt == LUA_VLCL) {
+            proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
+        } else if (cl->c.tt == LUA_VCCL) {
+            proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
         }
-    } 
-    // 通常 LUA_VLCF 可以用下面方式成功获取
-    if (!prototype) {
-        lua_getinfo(L, "f", far); 
-        prototype = lua_topointer(L, -1); 
-        //printf("get prototype by getinfo, prototype = %p\n", prototype);
-        if (!prototype) {
-            printf("get prototype fail at last\n");
-        }        
     }
-    return prototype;
+    }
+    if (!proto) {
+        // 兜底：仍可能遇到少数拿不到 TValue 的情况
+        lua_getinfo(L, "f", ar);
+        proto = lua_topointer(L, -1);
+        lua_pop(L, 1);
+    }
+    return proto;
 }
 
 #ifndef GET_ALL_KIND_PROTOTYPE
@@ -377,7 +378,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         return;
     }
     struct profile_context* context = _get_profile(L);
-    if(context->start == 0) {
+    if(context->start_time == 0) {
         return;
     }
 
@@ -425,6 +426,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         } else {
             lua_getinfo(L, "f", far);
             point = lua_topointer(L, -1);
+            lua_pop(L, 1);
         }
 
         struct icallpath_context* pre_callpath = NULL;
@@ -577,7 +579,7 @@ _lstart(lua_State* L) {
     }
     set_profile_started(L);
     struct profile_context* context = profile_create();
-    context->start = gettime();
+    context->start_time = gettime();
     context->running_in_hook = true;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     lua_setallocf(L, _resolve_alloc, context);
@@ -638,10 +640,10 @@ _lmark(lua_State* L) {
     if(co == NULL) {
         co = L;
     }
-    if(context->start != 0) {
+    if(context->start_time != 0) {
         lua_sethook(co, _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
-    lua_pushboolean(L, context->start != 0);
+    lua_pushboolean(L, context->start_time != 0);
     return 1;
 }
 
@@ -668,7 +670,7 @@ _ldump(lua_State* L) {
     struct profile_context* context = _get_profile(L);
     if (context && context->callpath) {
         context->running_in_hook = true;
-        uint64_t record_time = realtime(gettime() - context->start) * MICROSEC;
+        uint64_t record_time = realtime(gettime() - context->start_time) * MICROSEC;
         lua_pushinteger(L, record_time);
         dump_call_path(L, context->callpath);
         context->running_in_hook = false;
