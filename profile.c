@@ -356,7 +356,7 @@ test1()
 
 结果可用 https://jsongrid.com/ 查看
 */
-static const void* _get_all_kind_prototype(lua_State* L, lua_Debug* ar) {
+static const void* get_prototype(lua_State* L, lua_Debug* ar) {
     const void* proto = NULL;
     if (ar->i_ci && ar->i_ci->func.p) {
         const TValue* tv = s2v(ar->i_ci->func.p);
@@ -377,6 +377,7 @@ static const void* _get_all_kind_prototype(lua_State* L, lua_Debug* ar) {
         lua_getinfo(L, "f", ar);
         proto = lua_topointer(L, -1);
         lua_pop(L, 1);
+        printf("get prototype by getinfo: %p\n", proto);
     }
     return proto;
 }
@@ -441,7 +442,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->call_time = cur_time;
         frame->alloc_co_cost = 0;
         frame->alloc_start = context->alloc_count;
-        frame->prototype = _get_all_kind_prototype(L, far);    
+        frame->prototype = get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
