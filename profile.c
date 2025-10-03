@@ -6,6 +6,7 @@
 #include "lobject.h"
 #include "lstate.h"
 #include <pthread.h>
+#include <string.h>
 
 // #include <google/profiler.h>
 
@@ -80,6 +81,7 @@ struct profile_context {
     void*       last_alloc_ud;
     struct imap_context*        cs_map;
     struct imap_context*        alloc_map;
+    struct imap_context*        symbol_map;
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
 };
@@ -124,6 +126,33 @@ alloc_node_create() {
     return node;
 }
 
+struct symbol_info {
+    char* name;
+    char* source;
+    int line;
+};
+
+static inline char*
+pstrdup(const char* s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char* d = (char*)pmalloc(n + 1);
+    memcpy(d, s, n);
+    d[n] = '\0';
+    return d;
+}
+
+static void
+_ob_free_symbol(uint64_t key, void* value, void* ud) {
+    (void)key; (void)ud;
+    struct symbol_info* si = (struct symbol_info*)value;
+    if (si) {
+        if (si->name) pfree(si->name);
+        if (si->source) pfree(si->source);
+        pfree(si);
+    }
+}
+
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -131,6 +160,7 @@ profile_create() {
     context->start_time = 0;
     context->cs_map = imap_create();
     context->alloc_map = imap_create();
+    context->symbol_map = imap_create();
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->running_in_hook = false;
@@ -156,6 +186,8 @@ profile_free(struct profile_context* context) {
 
     imap_dump(context->cs_map, _ob_free_call_state, NULL);
     imap_free(context->cs_map);
+    imap_dump(context->symbol_map, _ob_free_symbol, NULL);
+    imap_free(context->symbol_map);
     pfree(context);
 }
 
@@ -246,38 +278,46 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
 
     struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(cur_path);
     if (cur_node->name == NULL) {
-        const char* name = NULL;
-        #ifdef USE_EXPORT_NAME
-            lua_getinfo(co, "nSl", far);
-            name = far->name;
-        #else
-            lua_getinfo(co, "Sl", far);
-        #endif
-        int line = far->linedefined;
-        const char* source = far->source;
-        char flag = far->what[0];
-        if (flag == 'C') {
-            lua_Debug ar2;
-            int i=0;
-            int ret = 0;
-            do {
-                i++;
-                ret = lua_getstack(co, i, &ar2);
-                flag = 'C';
-                if(ret) {
-                    lua_getinfo(co, "Sl", &ar2);
-                    if(ar2.what[0] != 'C') {
-                        line = ar2.currentline;
-                        source = ar2.source;
-                        break;
+        uint64_t sym_key = (uint64_t)((uintptr_t)cur_cf->prototype);
+        struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
+        if (!si) {
+            const char* name = NULL;
+            #ifdef USE_EXPORT_NAME
+                lua_getinfo(co, "nSl", far);
+                name = far->name;
+            #else
+                lua_getinfo(co, "Sl", far);
+            #endif
+            int line = far->linedefined;
+            const char* source = far->source;
+            char flag = far->what[0];
+            if (flag == 'C') {
+                lua_Debug ar2;
+                int i=0;
+                int ret = 0;
+                do {
+                    i++;
+                    ret = lua_getstack(co, i, &ar2);
+                    flag = 'C';
+                    if(ret) {
+                        lua_getinfo(co, "Sl", &ar2);
+                        if(ar2.what[0] != 'C') {
+                            line = ar2.currentline;
+                            source = ar2.source;
+                            break;
+                        }
                     }
-                }
-            }while(ret);
+                }while(ret);
+            }
+            si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+            si->name = pstrdup(name ? name : "null");
+            si->source = pstrdup(source ? source : "null");
+            si->line = line;
+            imap_set(context->symbol_map, sym_key, si);
         }
-
-        cur_node->name = name ? name : "null";
-        cur_node->source = source ? source : "null";
-        cur_node->line = line;
+        cur_node->name = si->name;
+        cur_node->source = si->source;
+        cur_node->line = si->line;
     }
     
     return cur_path;
@@ -541,10 +581,10 @@ _lstart(lua_State* L) {
     context->running_in_hook = true;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     lua_setallocf(L, _resolve_alloc, context);
-    lua_State* states[MAX_CO_SIZE] = {0};
     // stop gc before set hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
+    lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
         lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
@@ -567,10 +607,10 @@ _lstop(lua_State* L) {
     }
     context->running_in_hook = true;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
-    lua_State* states[MAX_CO_SIZE] = {0};
     // stop gc before unset hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }    
+    lua_State* states[MAX_CO_SIZE] = {0};
     int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
     int i;
     for (i = sz - 1; i >= 0; i--) {
