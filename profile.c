@@ -14,11 +14,8 @@
 #define MAX_CO_SIZE                 1024
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
-#define USE_EXPORT_NAME             1
-#define GET_ALL_KIND_PROTOTYPE      1
 
 static char profile_started_key = 'x';
-
 struct profile_context;
 
 /*
@@ -281,13 +278,8 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         uint64_t sym_key = (uint64_t)((uintptr_t)cur_cf->prototype);
         struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
         if (!si) {
-            const char* name = NULL;
-            #ifdef USE_EXPORT_NAME
-                lua_getinfo(co, "nSl", far);
-                name = far->name;
-            #else
-                lua_getinfo(co, "Sl", far);
-            #endif
+            lua_getinfo(co, "nSl", far);
+            const char* name = far->name;
             int line = far->linedefined;
             const char* source = far->source;
             char flag = far->what[0];
@@ -298,7 +290,6 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
                 do {
                     i++;
                     ret = lua_getstack(co, i, &ar2);
-                    flag = 'C';
                     if(ret) {
                         lua_getinfo(co, "Sl", &ar2);
                         if(ar2.what[0] != 'C') {
@@ -307,7 +298,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
                             break;
                         }
                     }
-                }while(ret);
+                } while(ret);
             }
             si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
             si->name = pstrdup(name ? name : "null");
