@@ -217,23 +217,22 @@ static void unset_profile_started(lua_State* L) {
 }
 
 static struct icallpath_context*
-get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, struct icallpath_context* pre_callpath, struct call_frame* frame) {
+get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, struct icallpath_context* pre_path, struct call_frame* frame) {
     if (!context->callpath) {
         struct callpath_node* node = callpath_node_create();
         node->name = "total";
         node->source = node->name;
         context->callpath = icallpath_create(0, node);
     }
-    struct icallpath_context* path = pre_callpath;
-    if (!path) {
-        path = context->callpath;
+    if (!pre_path) {
+        pre_path = context->callpath;
     }
 
     struct call_frame* cur_cf = frame;
     uint64_t k = (uint64_t)((uintptr_t)cur_cf->prototype);
-    struct icallpath_context* child_path = icallpath_get_child(path, k);
-    if (!child_path) {
-        struct callpath_node* path_parent = (struct callpath_node*)icallpath_getvalue(path);
+    struct icallpath_context* cur_path = icallpath_get_child(pre_path, k);
+    if (!cur_path) {
+        struct callpath_node* path_parent = (struct callpath_node*)icallpath_getvalue(pre_path);
         struct callpath_node* node = callpath_node_create();
 
         node->parent = path_parent;
@@ -242,11 +241,10 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         node->record_time = 0;
         node->count = 0;
         node->alloc_count = 0;
-        child_path = icallpath_add_child(path, k, node);
+        cur_path = icallpath_add_child(pre_path, k, node);
     }
-    path = child_path;
 
-    struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(path);
+    struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(cur_path);
     if (cur_node->name == NULL) {
         const char* name = NULL;
         #ifdef USE_EXPORT_NAME
@@ -282,7 +280,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         cur_node->line = line;
     }
     
-    return path;
+    return cur_path;
 }
 
 static void*
