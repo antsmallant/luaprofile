@@ -101,6 +101,12 @@ struct alloc_node {
     uint64_t alloc_size;
 };
 
+struct symbol_info {
+    char* name;
+    char* source;
+    int line;
+};
+
 static struct callpath_node*
 callpath_node_create() {
     struct callpath_node* node = (struct callpath_node*)pmalloc(sizeof(*node));
@@ -119,11 +125,13 @@ callpath_node_create() {
     return node;
 }
 
-struct symbol_info {
-    char* name;
-    char* source;
-    int line;
-};
+static struct alloc_node*
+alloc_node_create() {
+    struct alloc_node* node = (struct alloc_node*)pmalloc(sizeof(*node));
+    node->path = NULL;
+    node->alloc_size = 0;
+    return node;
+}
 
 static inline char*
 pstrdup(const char* s) {
@@ -330,6 +338,15 @@ static inline void _accumulate_on_stack(struct profile_context* context,
     }
 }
 
+// 取当前栈的叶子节点（用于 last-alloc-wins 路径归因）
+static inline struct callpath_node* _current_leaf_node(struct profile_context* context) {
+    struct call_state* cs = context->cur_cs;
+    if (!cs) return NULL;
+    struct call_frame* leaf = cur_callframe(cs);
+    if (!leaf || !leaf->path) return NULL;
+    return (struct callpath_node*)icallpath_getvalue(leaf->path);
+}
+
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
@@ -375,12 +392,8 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
 
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
-        if (an == NULL) {
-            an = (struct alloc_node*)pmalloc(sizeof(*an));
-        }
-        struct call_state* cs_map = context->cur_cs;
-        struct call_frame* leaf = (cs_map ? cur_callframe(cs_map) : NULL);
-        an->path = (leaf && leaf->path) ? (struct callpath_node*)icallpath_getvalue(leaf->path) : NULL;
+        if (an == NULL) an = alloc_node_create();
+        an->path = _current_leaf_node(context);
         an->alloc_size = newsize;
         imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
 
@@ -410,32 +423,24 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
             }
         }
 
-        // 维护映射与大小；若地址搬移，迁移键
-        // 准备“当前叶子节点”，用于 last-alloc-wins 归因
-        struct call_state* cur_cs = context->cur_cs;
-        struct call_frame* cur_frame = (cur_cs ? cur_callframe(cur_cs) : NULL);
-        struct callpath_node* leaf_node = (cur_frame && cur_frame->path) ?
-            (struct callpath_node*)icallpath_getvalue(cur_frame->path) : NULL;
+        struct callpath_node* leaf_node = _current_leaf_node(context);
 
         if (alloc_ret != ptr && alloc_ret != NULL) {
+            // 1、realloc 引起地址变化，需要更新映射
             struct alloc_node* an_move = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (an_move == NULL) {
-                // 兜底：若旧键缺失，建立新记录但无归因路径（极少发生）
-                an_move = (struct alloc_node*)pmalloc(sizeof(*an_move));
-                an_move->path = NULL;
-                an_move->alloc_size = 0;
-            }
+            if (an_move == NULL) an_move = alloc_node_create();
             an_move->alloc_size = newsize;
-            // realloc 搬移后，采用 last-alloc-wins：更新归因路径为当前叶子
+            // 更新归因路径为当前叶子
             if (leaf_node && (newsize >= old)) {
                 an_move->path = leaf_node;
             }
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an_move);
         } else {
+            // 2、realloc 但地址不变，需要更新大小
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an) {
                 an->alloc_size = newsize;
-                // in-place grow：更新归因路径为当前叶子
+                // 更新归因路径为当前叶子
                 if (leaf_node && add_bytes) {
                     an->path = leaf_node;
                 }
