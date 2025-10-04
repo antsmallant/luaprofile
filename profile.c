@@ -15,7 +15,7 @@
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
-static char profile_started_key = 'x';
+static char profile_context_key = 'x';
 struct profile_context;
 
 /*
@@ -218,32 +218,23 @@ cur_callframe(struct call_state* cs) {
 }
 
 static inline struct profile_context *
-_get_profile(lua_State* L) {
-    void *ud = NULL;
-    lua_getallocf(L, &ud);
-    return ud;
-}
-
-static bool chk_profile_started(lua_State* L) {
-    // 检查是否已经启动
-    lua_pushlightuserdata(L, &profile_started_key);
+get_profile_context(lua_State* L) {
+    struct profile_context* ctx = NULL;
+    lua_pushlightuserdata(L, &profile_context_key);
     lua_rawget(L, LUA_REGISTRYINDEX);
-    if (lua_toboolean(L, -1)) {
-        lua_pop(L, 1);
-        return true;
-    }
-    lua_pop(L, 1);  
-    return false;  
+    ctx = (struct profile_context*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    return ctx;
 }
 
-static void set_profile_started(lua_State* L) {
-    lua_pushlightuserdata(L, &profile_started_key);
-    lua_pushboolean(L, 1);
+static void set_profile_context(lua_State* L, struct profile_context* ctx) {
+    lua_pushlightuserdata(L, &profile_context_key);
+    lua_pushlightuserdata(L, (void*)ctx);
     lua_rawset(L, LUA_REGISTRYINDEX);
 }
 
-static void unset_profile_started(lua_State* L) {
-    lua_pushlightuserdata(L, &profile_started_key);
+static void unset_profile_context(lua_State* L) {
+    lua_pushlightuserdata(L, &profile_context_key);
     lua_pushnil(L);
     lua_rawset(L, LUA_REGISTRYINDEX);
 }
@@ -387,11 +378,11 @@ static const void* get_prototype(lua_State* L, lua_Debug* ar) {
 
 static void
 _resolve_hook(lua_State* L, lua_Debug* far) {
-    if (!chk_profile_started(L)) {
+    struct profile_context* context = get_profile_context(L);
+    if (context == NULL) {
         printf("resolve hook fail, profile not started\n");
         return;
     }
-    struct profile_context* context = _get_profile(L);
     if(context->start_time == 0 || !context->is_ready) {
         return;
     }
@@ -566,16 +557,17 @@ get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
 
 static int
 _lstart(lua_State* L) {
-    if (chk_profile_started(L)) {
+    struct profile_context* context = get_profile_context(L);
+    if (context != NULL) {
         printf("start fail, profile already started\n");
         return 0;
     }
-    set_profile_started(L);
-    struct profile_context* context = profile_create();
+    context = profile_create();
     context->start_time = gettime();
     context->running_in_hook = true;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     lua_setallocf(L, _resolve_alloc, context);
+    set_profile_context(L, context);
     // stop gc before set hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
@@ -593,12 +585,9 @@ _lstart(lua_State* L) {
 
 static int
 _lstop(lua_State* L) {
-    if (!chk_profile_started(L)) {
+    struct profile_context* context = get_profile_context(L);
+    if (context == NULL) {
         printf("stop fail, profile not started\n");
-        return 0;
-    }
-    struct profile_context* context = _get_profile(L);
-    if (!context) {
         return 0;
     }
     context->is_ready = false;
@@ -616,19 +605,16 @@ _lstop(lua_State* L) {
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
     profile_free(context);
     context = NULL;
-    unset_profile_started(L);
+    unset_profile_context(L);
     printf("luaprofile stopped\n");
     return 0;
 }
 
 static int
 _lmark(lua_State* L) {
-    if (!chk_profile_started(L)) {
+    struct profile_context* context = get_profile_context(L);
+    if (context == NULL) {
         printf("mark fail, profile not started\n");
-        return 0;
-    }
-    struct profile_context* context = _get_profile(L);
-    if (!context) {
         return 0;
     }
     lua_State* co = lua_tothread(L, 1);
@@ -644,14 +630,11 @@ _lmark(lua_State* L) {
 
 static int
 _lunmark(lua_State* L) {
-    if (!chk_profile_started(L)) {
+    struct profile_context* context = get_profile_context(L);
+    if (context == NULL) {
         printf("unmark fail, profile not started\n");
         return 0;
     }    
-    struct profile_context* context = _get_profile(L);
-    if (!context) {
-        return 0;
-    }
     lua_State* co = lua_tothread(L, 1);
     if(co == NULL) {
         co = L;
@@ -662,7 +645,7 @@ _lunmark(lua_State* L) {
 
 static int
 _ldump(lua_State* L) {
-    struct profile_context* context = _get_profile(L);
+    struct profile_context* context = get_profile_context(L);
     if (context && context->callpath) {
         context->running_in_hook = true;
         uint64_t record_time = realtime(gettime() - context->start_time) * MICROSEC;
