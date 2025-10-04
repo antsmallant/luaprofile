@@ -417,9 +417,9 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
             if (add_bytes) _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
         } else if (old > newsize) {
             // shrink — 需要拿到分配路径
-            struct alloc_node* an_peek = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)(ptr));
-            if (an_peek && sub_bytes) {
-                _accumulate_on_path(an_peek->path, 0, 0, sub_bytes, sub_times);
+            struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)(ptr));
+            if (an && sub_bytes) {
+                _accumulate_on_path(an->path, 0, 0, sub_bytes, sub_times);
             }
         }
 
