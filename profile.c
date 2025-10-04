@@ -96,9 +96,13 @@ struct callpath_node {
     uint64_t free_times;
 };
 
+// 账本段：记录一次增长对某路径的字节贡献
+struct alloc_seg { struct callpath_node* path; size_t bytes; };
+#define MAX_ALLOC_SEGS 32
 struct alloc_node {
-    struct callpath_node* path;
-    uint64_t alloc_size;
+    size_t live;                // 当前存活字节
+    int seg_count;              // 段数量
+    struct alloc_seg segs[MAX_ALLOC_SEGS];
 };
 
 struct symbol_info {
@@ -128,8 +132,9 @@ callpath_node_create() {
 static struct alloc_node*
 alloc_node_create() {
     struct alloc_node* node = (struct alloc_node*)pmalloc(sizeof(*node));
-    node->path = NULL;
-    node->alloc_size = 0;
+    node->live = 0;
+    node->seg_count = 0;
+    for (int i = 0; i < MAX_ALLOC_SEGS; ++i) { node->segs[i].path = NULL; node->segs[i].bytes = 0; }
     return node;
 }
 
@@ -393,55 +398,95 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
 
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
         if (an == NULL) an = alloc_node_create();
-        an->path = _current_leaf_node(context);
-        an->alloc_size = newsize;
+        an->live = newsize;
+        an->seg_count = 0;
+        // 记录一次完整增长段（叶子路径）
+        struct callpath_node* leaf = _current_leaf_node(context);
+        if (leaf && newsize > 0) {
+            int k = an->seg_count < MAX_ALLOC_SEGS ? an->seg_count : (MAX_ALLOC_SEGS - 1);
+            if (an->seg_count < MAX_ALLOC_SEGS) an->seg_count++;
+            an->segs[k].path = leaf;
+            an->segs[k].bytes = newsize;
+        }
         imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
 
     } else if (old > 0 && newsize == 0) {
         // [free] 归因指针当前保存的上下文（沿父链回溯），删除映射
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
-            // 以存活字节为准，避免之前的 shrink 被重复扣减
-            size_t live = an->alloc_size;
-            if (live) _accumulate_on_path(an->path, 0, 0, live, 1);
-            // 在这里才设置 sub_* 供全局累计
-            sub_bytes = live;
-            sub_times = live ? 1 : 0;
+            size_t need = an->live;
+            // LIFO 段回退
+            while (need > 0 && an->seg_count > 0) {
+                int k = an->seg_count - 1;
+                size_t take = an->segs[k].bytes <= need ? an->segs[k].bytes : need;
+                if (take > 0 && an->segs[k].path) _accumulate_on_path(an->segs[k].path, 0, 0, take, 1);
+                an->segs[k].bytes -= take;
+                need -= take;
+                if (an->segs[k].bytes == 0) an->seg_count--;
+            }
+            sub_bytes = an->live; sub_times = (an->live ? 1 : 0);
+            an->live = 0;
             pfree(an);
         }
 
     } else if (old > 0 && newsize > 0) {
         // [realloc] 拆为增长/收缩的 delta：grow 归因“当前栈”；shrink 归因“旧上下文”；同时维护映射
         struct callpath_node* leaf_node = _current_leaf_node(context);
-
-        // 1) 计量
+        // 1) 计量 + 账本
         if (add_bytes) {
             _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
         }
         if (sub_bytes) {
             struct alloc_node* anq = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (anq) _accumulate_on_path(anq->path, 0, 0, sub_bytes, sub_times);
+            if (anq) {
+                size_t need = sub_bytes;
+                // LIFO 段回退
+                while (need > 0 && anq->seg_count > 0) {
+                    int k = anq->seg_count - 1;
+                    size_t take = anq->segs[k].bytes <= need ? anq->segs[k].bytes : need;
+                    if (take > 0 && anq->segs[k].path) _accumulate_on_path(anq->segs[k].path, 0, 0, take, 1);
+                    anq->segs[k].bytes -= take;
+                    need -= take;
+                    if (anq->segs[k].bytes == 0) anq->seg_count--;
+                }
+            }
         }
 
-        // 2) 映射
+        // 2) 映射（live 与段）
         if (alloc_ret != ptr && alloc_ret != NULL) {
-            // 搬移：取旧记录→更新 live→（若增长）更新上下文→写入新键
+            // 搬移：取旧记录→更新 live/段→写入新键
             struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an == NULL) an = alloc_node_create();
-            an->alloc_size = newsize;
-            if (leaf_node && add_bytes) an->path = leaf_node;  // 仅在增长时更新上下文
+            // 增长段追加
+            if (add_bytes && leaf_node) {
+                int k = (an->seg_count > 0 && an->segs[an->seg_count-1].path == leaf_node)
+                        ? (an->seg_count-1) : (an->seg_count < MAX_ALLOC_SEGS ? an->seg_count++ : an->seg_count-1);
+                an->segs[k].path = leaf_node;
+                an->segs[k].bytes += add_bytes;
+            }
+            an->live = newsize;
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
         } else {
-            // 原地：更新 live；（若增长）更新上下文
+            // 原地：更新 live；增长段追加
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an) {
-                an->alloc_size = newsize;
-                if (leaf_node && add_bytes) an->path = leaf_node;
+                if (add_bytes && leaf_node) {
+                    int k = (an->seg_count > 0 && an->segs[an->seg_count-1].path == leaf_node)
+                            ? (an->seg_count-1) : (an->seg_count < MAX_ALLOC_SEGS ? an->seg_count++ : an->seg_count-1);
+                    an->segs[k].path = leaf_node;
+                    an->segs[k].bytes += add_bytes;
+                }
+                an->live = newsize;
             } else {
-                // 兜底：缺记录则补建，避免后续 free 无上下文
+                // 兜底：缺记录则补建，写入增长段
                 an = alloc_node_create();
-                an->path = leaf_node;
-                an->alloc_size = newsize;
+                an->live = newsize;
+                an->seg_count = 0;
+                if (add_bytes && leaf_node) {
+                    int k = an->seg_count < MAX_ALLOC_SEGS ? an->seg_count++ : (MAX_ALLOC_SEGS - 1);
+                    an->segs[k].path = leaf_node;
+                    an->segs[k].bytes = add_bytes;
+                }
                 imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
             }
         }

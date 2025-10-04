@@ -32,16 +32,20 @@ local function test_vccl()
 end
 
 local function test_storage1()
-    for i = 1, 1000000 do
+    for i = 1, 100 do
         table.insert(g_storage, i)
     end
 end
 
 local function test_storage2()
-    for i = 1, 1000000 do
+    for i = 1, 10 do
         table.insert(g_storage, i)
     end
-    g_storage = {}
+    g_storage = {} 
+    collectgarbage("collect")
+    for i = 1, 100 do
+        table.insert(g_storage, i)
+    end
 end
 
 local function test1()
