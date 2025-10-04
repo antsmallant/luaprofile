@@ -6,6 +6,7 @@
 #include "lobject.h"
 #include "lstate.h"
 #include <pthread.h>
+#include <stdint.h>
 #include <string.h>
 
 /*
@@ -44,8 +45,6 @@ realtime(uint64_t t) {
     return (double)t / NANOSEC;
 }
 
-
-struct callpath_node;
 struct call_frame {
     const void* prototype;
     struct icallpath_context*   path;
@@ -54,14 +53,11 @@ struct call_frame {
     uint64_t ret_time;
     uint64_t sub_cost;
     uint64_t real_cost;
-    uint64_t alloc_co_cost;
-    uint64_t alloc_start;
 };
 
 struct call_state {
     lua_State*  co;
     uint64_t    leave_time;
-    uint64_t    leave_alloc;
     int         top;
     struct call_frame   call_list[0];
 };
@@ -70,10 +66,12 @@ struct profile_context {
     uint64_t    start_time;
     bool        is_ready; // 是否就绪
     bool        running_in_hook;  // 是否正在运行 hook 逻辑
-    
-    uint64_t    alloc_count;
-    uint64_t    free_count;
-    uint64_t    realloc_count;
+
+    // 全局内存统计（仅按 alloc/free 维度聚合；realloc 记为增量/减量）
+    uint64_t    alloc_bytes_total;
+    uint64_t    free_bytes_total;
+    uint64_t    alloc_times_total;
+    uint64_t    free_times_total;
     lua_Alloc   last_alloc_f;
     void*       last_alloc_ud;
     struct imap_context*        cs_map;
@@ -92,7 +90,10 @@ struct callpath_node {
     uint64_t ret_time;
     uint64_t count;
     uint64_t record_time;
-    uint64_t alloc_count;
+    uint64_t alloc_bytes;
+    uint64_t free_bytes;
+    uint64_t alloc_times;
+    uint64_t free_times;
 };
 
 struct alloc_node {
@@ -111,7 +112,10 @@ callpath_node_create() {
     node->ret_time = 0;
     node->count = 0;
     node->record_time = 0;
-    node->alloc_count = 0;
+    node->alloc_bytes = 0;
+    node->free_bytes = 0;
+    node->alloc_times = 0;
+    node->free_times = 0;
     return node;
 }
 
@@ -162,9 +166,10 @@ profile_create() {
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->running_in_hook = false;
-    context->alloc_count = 0;
-    context->free_count = 0;
-    context->realloc_count = 0;
+    context->alloc_bytes_total = 0;
+    context->free_bytes_total = 0;
+    context->alloc_times_total = 0;
+    context->free_times_total = 0;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     return context;
@@ -261,7 +266,6 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         node->ret_time = 0;
         node->record_time = 0;
         node->count = 0;
-        node->alloc_count = 0;
         cur_path = icallpath_add_child(pre_path, k, node);
     }
 
@@ -314,16 +318,59 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         return alloc_ret;
     }
 
-    size_t old = ptr == NULL ? 0 : osize;
-    if (nsize > 0 && nsize > old) {
-        context->alloc_count += (nsize - old);
-    }    
+    // 事件语义：
+    // - alloc:  osize==0 && nsize>0
+    // - free:   osize>0 && nsize==0
+    // - realloc osize>0 && nsize>0 → 以增量/减量计入全局与当前路径
 
-    // free
+    size_t old = (ptr == NULL) ? 0 : osize;
+    size_t newsize = nsize;
 
-    // alloc
+    // 本次事件的增量/减量
+    size_t add_bytes = 0;
+    size_t sub_bytes = 0;
+    uint64_t add_times = 0;
+    uint64_t sub_times = 0;
 
-    // realloc
+    if (old == 0 && newsize > 0) {
+        // alloc
+        add_bytes = newsize;
+        add_times = 1;
+    } else if (old > 0 && newsize == 0) {
+        // free
+        sub_bytes = old;
+        sub_times = 1;
+    } else if (old > 0 && newsize > 0) {
+        // realloc → 仅以增量/减量计入
+        if (newsize > old) {
+            add_bytes = newsize - old;
+            add_times = 1;
+        } else if (old > newsize) {
+            sub_bytes = old - newsize;
+            sub_times = 1;
+        }
+    }
+
+    // 全局累计
+    if (add_bytes) context->alloc_bytes_total += add_bytes;
+    if (add_times) context->alloc_times_total += add_times;
+    if (sub_bytes) context->free_bytes_total += sub_bytes;
+    if (sub_times) context->free_times_total += sub_times;
+
+    // 归因路径：对整条调用栈（父链）做 inclusive 累加
+    struct call_state* cs = context->cur_cs;
+    if (cs && cs->top > 0) {
+        for (int i = 0; i < cs->top; i++) {
+            struct call_frame* f = &cs->call_list[i];
+            if (!f->path) continue;
+            struct callpath_node* n = (struct callpath_node*)icallpath_getvalue(f->path);
+            if (!n) continue;
+            if (add_bytes) n->alloc_bytes += add_bytes;
+            if (add_times) n->alloc_times += add_times;
+            if (sub_bytes) n->free_bytes += sub_bytes;
+            if (sub_times) n->free_times += sub_times;
+        }
+    }
 
     return alloc_ret;
 }
@@ -397,28 +444,23 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
             cs->co = L; 
             cs->top = 0;
             cs->leave_time = 0;
-            cs->leave_alloc = 0;
             imap_set(context->cs_map, key, cs);
         }
 
         if (context->cur_cs) {
             context->cur_cs->leave_time = cur_time;
-            context->cur_cs->leave_alloc = context->alloc_count;
         }
         context->cur_cs = cs;
     }
     if (cs->leave_time > 0) {
         assert(cur_time >= cs->leave_time);
         uint64_t co_cost = cur_time - cs->leave_time;
-        uint64_t co_alloc = context->alloc_count - cs->leave_alloc;
 
         int i = 0;
         for (; i < cs->top; i++) {
             cs->call_list[i].sub_cost += co_cost;
-            cs->call_list[i].alloc_co_cost += co_alloc;
         }
         cs->leave_time = 0;
-        cs->leave_alloc = 0;
     }
     assert(cs->co == L);
 
@@ -432,8 +474,6 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->tail = (event == LUA_HOOKTAILCALL);
         frame->sub_cost = 0;
         frame->call_time = cur_time;
-        frame->alloc_co_cost = 0;
-        frame->alloc_start = context->alloc_count;
         frame->prototype = get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
@@ -448,16 +488,12 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
             struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
             uint64_t total_cost = cur_time - cur_frame->call_time;
             uint64_t real_cost = total_cost - cur_frame->sub_cost;
-            uint64_t alloc_count = context->alloc_count - cur_frame->alloc_start - cur_frame->alloc_co_cost;
-            assert(context->alloc_count >= (cur_frame->alloc_start + cur_frame->alloc_co_cost));
             assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->sub_cost);
             cur_frame->ret_time = cur_time;
             cur_frame->real_cost = real_cost;
-
             cur_path->ret_time = cur_path->ret_time == 0 ? cur_time : cur_path->ret_time;
             cur_path->record_time += real_cost;
             cur_path->count++;
-            cur_path->alloc_count += alloc_count;
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
@@ -473,7 +509,7 @@ struct dump_call_path_arg {
     uint64_t record_time;
     uint64_t count;
     uint64_t index;
-    uint64_t alloc_count;
+    // 兼容旧字段移除：不再统计 alloc_count
 };
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
@@ -493,7 +529,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     child_arg.record_time = 0;
     child_arg.count = 0;
     child_arg.index = 0;
-    child_arg.alloc_count = 0;
 
     if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
@@ -502,14 +537,12 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
-    uint64_t alloc_count = node->alloc_count > child_arg.alloc_count ? node->alloc_count : child_arg.alloc_count;
     uint64_t count = node->count > child_arg.count ? node->count : child_arg.count;
     uint64_t rt = realtime(node->record_time) * MICROSEC;
     uint64_t record_time = rt > child_arg.record_time ? rt : child_arg.record_time;
 
     arg->record_time += record_time;
     arg->count += count;
-    arg->alloc_count += alloc_count;
 
     char name[512] = {0};
     snprintf(name, sizeof(name)-1, "%s %s:%d", node->name ? node->name : "", node->source ? node->source : "", node->line);
@@ -525,8 +558,14 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, node->ret_time);
     lua_setfield(arg->L, -2, "rettime");
 
-    lua_pushinteger(arg->L, alloc_count);
-    lua_setfield(arg->L, -2, "alloc_count");
+    lua_pushinteger(arg->L, (lua_Integer)node->alloc_bytes);
+    lua_setfield(arg->L, -2, "alloc_bytes");
+    lua_pushinteger(arg->L, (lua_Integer)node->free_bytes);
+    lua_setfield(arg->L, -2, "free_bytes");
+    lua_pushinteger(arg->L, (lua_Integer)node->alloc_times);
+    lua_setfield(arg->L, -2, "alloc_times");
+    lua_pushinteger(arg->L, (lua_Integer)node->free_times);
+    lua_setfield(arg->L, -2, "free_times");
 }
 
 static void dump_call_path(lua_State* L, struct icallpath_context* path) {
@@ -535,7 +574,6 @@ static void dump_call_path(lua_State* L, struct icallpath_context* path) {
     arg.record_time = 0;
     arg.count = 0;
     arg.index = 0;
-    arg.alloc_count = 0;
     _dump_call_path(path, &arg);
 }
 
