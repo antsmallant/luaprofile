@@ -70,7 +70,9 @@ struct call_state {
 
 struct profile_context {
     uint64_t    start_time;
+    bool        is_ready; // 是否就绪
     bool        running_in_hook;  // 是否正在运行 hook 逻辑
+    
     uint64_t    alloc_count;
     uint64_t    free_count;
     uint64_t    realloc_count;
@@ -155,6 +157,7 @@ profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
     
     context->start_time = 0;
+    context->is_ready = false;
     context->cs_map = imap_create();
     context->alloc_map = imap_create();
     context->symbol_map = imap_create();
@@ -318,7 +321,7 @@ static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
     void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
-    if (context->running_in_hook) {
+    if (context->running_in_hook || !context->is_ready) {
         return alloc_ret;
     }
 
@@ -389,7 +392,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         return;
     }
     struct profile_context* context = _get_profile(L);
-    if(context->start_time == 0) {
+    if(context->start_time == 0 || !context->is_ready) {
         return;
     }
 
@@ -584,6 +587,7 @@ _lstart(lua_State* L) {
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
     printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);
     context->running_in_hook = false;
+    context->is_ready = true;
     return 0;
 }
 
@@ -597,6 +601,7 @@ _lstop(lua_State* L) {
     if (!context) {
         return 0;
     }
+    context->is_ready = false;
     context->running_in_hook = true;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
     // stop gc before unset hook
