@@ -6,9 +6,11 @@ local profile = require "profile"
 local json = require "json"
 
 local function test3()
+    local t = {}
     local s = 0
     for i = 1, 10000 do
         s = s + i
+        table.insert(t, i)
     end
 end
 

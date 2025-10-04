@@ -119,14 +119,6 @@ callpath_node_create() {
     return node;
 }
 
-static struct alloc_node*
-alloc_node_create() {
-    struct alloc_node* node = (struct alloc_node*)pmalloc(sizeof(*node));
-    node->path = NULL;
-    node->alloc_size = 0;
-    return node;
-}
-
 struct symbol_info {
     char* name;
     char* source;
@@ -310,6 +302,34 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     return cur_path;
 }
 
+// 将增量累加到一条父链（包含起点）
+static inline void _accumulate_on_path(struct callpath_node* node,
+    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times) {
+    for (struct callpath_node* n = node; n != NULL; n = n->parent) {
+        if (add_bytes) n->alloc_bytes += add_bytes;
+        if (add_times) n->alloc_times += add_times;
+        if (sub_bytes) n->free_bytes += sub_bytes;
+        if (sub_times) n->free_times += sub_times;
+    }
+}
+
+// 将增量累加到当前调用栈的所有帧（inclusive）
+static inline void _accumulate_on_stack(struct profile_context* context,
+    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times) {
+    struct call_state* cs = context->cur_cs;
+    if (!cs || cs->top <= 0) return;
+    for (int i = 0; i < cs->top; i++) {
+        struct call_frame* f = &cs->call_list[i];
+        if (!f->path) continue;
+        struct callpath_node* n = (struct callpath_node*)icallpath_getvalue(f->path);
+        if (!n) continue;
+        if (add_bytes) n->alloc_bytes += add_bytes;
+        if (add_times) n->alloc_times += add_times;
+        if (sub_bytes) n->free_bytes += sub_bytes;
+        if (sub_times) n->free_times += sub_times;
+    }
+}
+
 static void*
 _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
@@ -337,9 +357,7 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         add_bytes = newsize;
         add_times = 1;
     } else if (old > 0 && newsize == 0) {
-        // free
-        sub_bytes = old;
-        sub_times = 1;
+        // free — 延后到移除映射后再确定 sub_bytes/sub_times
     } else if (old > 0 && newsize > 0) {
         // realloc → 仅以增量/减量计入
         if (newsize > old) {
@@ -351,26 +369,69 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         }
     }
 
-    // 全局累计
+    // 维护活跃映射与按路径/按栈累加（注意：free 的 sub_bytes 以映射的存活字节为准）
+    if (old == 0 && newsize > 0) {
+        // alloc：按当前调用栈累加；建立映射（以返回指针为键）
+        _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
+
+        struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
+        if (an == NULL) {
+            an = (struct alloc_node*)pmalloc(sizeof(*an));
+        }
+        struct call_state* cs_map = context->cur_cs;
+        struct call_frame* leaf = (cs_map ? cur_callframe(cs_map) : NULL);
+        an->path = (leaf && leaf->path) ? (struct callpath_node*)icallpath_getvalue(leaf->path) : NULL;
+        an->alloc_size = newsize;
+        imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
+
+    } else if (old > 0 && newsize == 0) {
+        // free：沿分配时的节点向父链回溯累加；删除映射（以旧指针为键）
+        struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+        if (an) {
+            // 以存活字节为准，避免之前的 shrink 被重复扣减
+            size_t live = an->alloc_size;
+            if (live) _accumulate_on_path(an->path, 0, 0, live, 1);
+            // 在这里才设置 sub_* 供全局累计
+            sub_bytes = live;
+            sub_times = live ? 1 : 0;
+            pfree(an);
+        }
+
+    } else if (old > 0 && newsize > 0) {
+        // realloc：增长按当前调用栈累加；收缩沿分配路径累加；迁移键（若搬移）并更新存活字节
+        if (newsize > old) {
+            // grow
+            if (add_bytes) _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
+        } else if (old > newsize) {
+            // shrink — 需要拿到分配路径
+            struct alloc_node* an_peek = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)(ptr));
+            if (an_peek && sub_bytes) {
+                _accumulate_on_path(an_peek->path, 0, 0, sub_bytes, sub_times);
+            }
+        }
+
+        // 维护映射与大小；若地址搬移，迁移键
+        if (alloc_ret != ptr && alloc_ret != NULL) {
+            struct alloc_node* an_move = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+            if (an_move == NULL) {
+                // 兜底：若旧键缺失，建立新记录但无归因路径（极少发生）
+                an_move = (struct alloc_node*)pmalloc(sizeof(*an_move));
+                an_move->path = NULL;
+                an_move->alloc_size = 0;
+            }
+            an_move->alloc_size = newsize;
+            imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an_move);
+        } else {
+            struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+            if (an) an->alloc_size = newsize;
+        }
+    }
+
+    // 全局累计（在最终确定 add/sub 后）
     if (add_bytes) context->alloc_bytes_total += add_bytes;
     if (add_times) context->alloc_times_total += add_times;
     if (sub_bytes) context->free_bytes_total += sub_bytes;
     if (sub_times) context->free_times_total += sub_times;
-
-    // 归因路径：对整条调用栈（父链）做 inclusive 累加
-    struct call_state* cs = context->cur_cs;
-    if (cs && cs->top > 0) {
-        for (int i = 0; i < cs->top; i++) {
-            struct call_frame* f = &cs->call_list[i];
-            if (!f->path) continue;
-            struct callpath_node* n = (struct callpath_node*)icallpath_getvalue(f->path);
-            if (!n) continue;
-            if (add_bytes) n->alloc_bytes += add_bytes;
-            if (add_times) n->alloc_times += add_times;
-            if (sub_bytes) n->free_bytes += sub_bytes;
-            if (sub_times) n->free_times += sub_times;
-        }
-    }
 
     return alloc_ret;
 }
@@ -690,6 +751,9 @@ _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context && context->callpath) {
         context->running_in_hook = true;
+        // stop gc before dump
+        int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
+        if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }        
         struct callpath_node* node = icallpath_getvalue(context->callpath);
         node->alloc_bytes = context->alloc_bytes_total;
         node->free_bytes = context->free_bytes_total;
@@ -699,6 +763,7 @@ _ldump(lua_State* L) {
         lua_pushinteger(L, record_time);
         dump_call_path(L, context->callpath);
         context->running_in_hook = false;
+        if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
         return 2;
     }
     return 0;
