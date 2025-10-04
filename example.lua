@@ -31,15 +31,23 @@ local function test_vccl()
     return acc
 end
 
-local function test_storage()
+local function test_storage1()
     for i = 1, 1000000 do
         table.insert(g_storage, i)
     end
 end
 
+local function test_storage2()
+    for i = 1, 1000000 do
+        table.insert(g_storage, i)
+    end
+    g_storage = {}
+end
+
 local function test1()
     profile.start()
-    test_storage()
+    test_storage1()
+    test_storage2()
     tonumber("123")    
     print("111")
     tonumber("234")

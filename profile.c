@@ -386,9 +386,9 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         }
     }
 
-    // 维护活跃映射与按路径/按栈累加（注意：free 的 sub_bytes 以映射的存活字节为准）
+    // 维护活跃映射与按路径/按栈累加（delta-based：tcmalloc/jemalloc 风格）
     if (old == 0 && newsize > 0) {
-        // alloc：按当前调用栈累加；建立映射（以返回指针为键）
+        // [alloc] 归因当前栈（inclusive），建立/更新映射
         _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
 
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
@@ -398,7 +398,7 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
 
     } else if (old > 0 && newsize == 0) {
-        // free：沿分配时的节点向父链回溯累加；删除映射（以旧指针为键）
+        // [free] 归因指针当前保存的上下文（沿父链回溯），删除映射
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
             // 以存活字节为准，避免之前的 shrink 被重复扣减
@@ -411,39 +411,38 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         }
 
     } else if (old > 0 && newsize > 0) {
-        // realloc：增长按当前调用栈累加；收缩沿分配路径累加；迁移键（若搬移）并更新存活字节
-        if (newsize > old) {
-            // grow
-            if (add_bytes) _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
-        } else if (old > newsize) {
-            // shrink — 需要拿到分配路径
-            struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)(ptr));
-            if (an && sub_bytes) {
-                _accumulate_on_path(an->path, 0, 0, sub_bytes, sub_times);
-            }
-        }
-
+        // [realloc] 拆为增长/收缩的 delta：grow 归因“当前栈”；shrink 归因“旧上下文”；同时维护映射
         struct callpath_node* leaf_node = _current_leaf_node(context);
 
+        // 1) 计量
+        if (add_bytes) {
+            _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
+        }
+        if (sub_bytes) {
+            struct alloc_node* anq = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+            if (anq) _accumulate_on_path(anq->path, 0, 0, sub_bytes, sub_times);
+        }
+
+        // 2) 映射
         if (alloc_ret != ptr && alloc_ret != NULL) {
-            // 1、地址变化，需要更新映射
+            // 搬移：取旧记录→更新 live→（若增长）更新上下文→写入新键
             struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an == NULL) an = alloc_node_create();
             an->alloc_size = newsize;
-            // 更新归因路径为当前叶子
-            if (leaf_node && (newsize >= old)) {
-                an->path = leaf_node;
-            }
+            if (leaf_node && add_bytes) an->path = leaf_node;  // 仅在增长时更新上下文
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
         } else {
-            // 2、地址不变，需要更新大小
+            // 原地：更新 live；（若增长）更新上下文
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an) {
                 an->alloc_size = newsize;
-                // 更新归因路径为当前叶子
-                if (leaf_node && add_bytes) {
-                    an->path = leaf_node;
-                }
+                if (leaf_node && add_bytes) an->path = leaf_node;
+            } else {
+                // 兜底：缺记录则补建，避免后续 free 无上下文
+                an = alloc_node_create();
+                an->path = leaf_node;
+                an->alloc_size = newsize;
+                imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
             }
         }
     }
