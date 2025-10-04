@@ -8,20 +8,12 @@
 #include <pthread.h>
 #include <string.h>
 
-// #include <google/profiler.h>
-
-#define MAX_CALL_SIZE               1024
-#define MAX_CO_SIZE                 1024
-#define NANOSEC                     1000000000
-#define MICROSEC                    1000000
-
-static char profile_context_key = 'x';
-struct profile_context;
-
 /*
-callpath 是棵树，每个frame可以在这个树中找到一个节点node，从前 framestack 从根到 cur frame, 对应到这棵树的一条路径。  
-prototype 是 callpath node 的 key，一个新的 frame 要找到对应的 callpath node，就用 prototype 从上一个 frame 的 node 里面查找 child node，找不到则创建。  
-同样 prototype 的函数，可能会在 callpath tree 有多个 node，这取决于它的父亲是谁。  
+callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
+
+prototype 相当于一个 lua closure/c closure/c function 在 lua vm 中的唯一指针。它是 callpath node 的 key，一个新的 frame 要找到对应的 callpath node，就用 prototype 从父frame 的 node 里面查找 child node，找不到则创建。  
+
+相同 prototype 的闭包或函数，可能会在 callpath tree 对应多个 node，这取决于它的父亲是谁。   
 
 node1
   node21
@@ -29,6 +21,12 @@ node1
 对应着 frame1 -> frame2 -> frame3 的调用关系。 
 */
 
+#define MAX_CALL_SIZE               1024
+#define MAX_CO_SIZE                 1024
+#define NANOSEC                     1000000000
+#define MICROSEC                    1000000
+
+static char profile_context_key = 'x';
 
 static inline uint64_t
 gettime() {
@@ -479,11 +477,13 @@ struct dump_call_path_arg {
 };
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
+
 static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
     struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
     _dump_call_path((struct icallpath_context*)value, arg);
     lua_seti(arg->L, -2, ++arg->index);
 }
+
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg) {
     lua_checkstack(arg->L, 3);
     lua_newtable(arg->L);
@@ -528,6 +528,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, alloc_count);
     lua_setfield(arg->L, -2, "alloc_count");
 }
+
 static void dump_call_path(lua_State* L, struct icallpath_context* path) {
     struct dump_call_path_arg arg;
     arg.L = L;
@@ -537,7 +538,6 @@ static void dump_call_path(lua_State* L, struct icallpath_context* path) {
     arg.alloc_count = 0;
     _dump_call_path(path, &arg);
 }
-
 
 static int 
 get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
@@ -606,7 +606,7 @@ _lstop(lua_State* L) {
         lua_sethook(states[i], NULL, 0, 0);
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
-    
+
     unset_profile_context(L);
     profile_free(context);
     context = NULL;
