@@ -383,7 +383,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         printf("resolve hook fail, profile not started\n");
         return;
     }
-    if(context->start_time == 0 || !context->is_ready) {
+    if(!context->is_ready) {
         return;
     }
 
@@ -564,10 +564,12 @@ _lstart(lua_State* L) {
     }
     context = profile_create();
     context->start_time = gettime();
+    context->is_ready = true;
     context->running_in_hook = true;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     lua_setallocf(L, _resolve_alloc, context);
     set_profile_context(L, context);
+
     // stop gc before set hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
@@ -577,9 +579,9 @@ _lstart(lua_State* L) {
         lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+
     printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);
     context->running_in_hook = false;
-    context->is_ready = true;
     return 0;
 }
 
@@ -593,6 +595,7 @@ _lstop(lua_State* L) {
     context->is_ready = false;
     context->running_in_hook = true;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
+
     // stop gc before unset hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }    
@@ -603,9 +606,10 @@ _lstop(lua_State* L) {
         lua_sethook(states[i], NULL, 0, 0);
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+    
+    unset_profile_context(L);
     profile_free(context);
     context = NULL;
-    unset_profile_context(L);
     printf("luaprofile stopped\n");
     return 0;
 }
@@ -621,10 +625,10 @@ _lmark(lua_State* L) {
     if(co == NULL) {
         co = L;
     }
-    if(context->start_time != 0) {
+    if(context->is_ready) {
         lua_sethook(co, _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
     }
-    lua_pushboolean(L, context->start_time != 0);
+    lua_pushboolean(L, context->is_ready);
     return 1;
 }
 
