@@ -426,17 +426,17 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         struct callpath_node* leaf_node = _current_leaf_node(context);
 
         if (alloc_ret != ptr && alloc_ret != NULL) {
-            // 1、realloc 引起地址变化，需要更新映射
-            struct alloc_node* an_move = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (an_move == NULL) an_move = alloc_node_create();
-            an_move->alloc_size = newsize;
+            // 1、地址变化，需要更新映射
+            struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+            if (an == NULL) an = alloc_node_create();
+            an->alloc_size = newsize;
             // 更新归因路径为当前叶子
             if (leaf_node && (newsize >= old)) {
-                an_move->path = leaf_node;
+                an->path = leaf_node;
             }
-            imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an_move);
+            imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
         } else {
-            // 2、realloc 但地址不变，需要更新大小
+            // 2、地址不变，需要更新大小
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an) {
                 an->alloc_size = newsize;
