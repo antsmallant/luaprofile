@@ -690,6 +690,11 @@ _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context && context->callpath) {
         context->running_in_hook = true;
+        struct callpath_node* node = icallpath_getvalue(context->callpath);
+        node->alloc_bytes = context->alloc_bytes_total;
+        node->free_bytes = context->free_bytes_total;
+        node->alloc_times = context->alloc_times_total;
+        node->free_times = context->free_times_total;
         uint64_t record_time = realtime(gettime() - context->start_time) * MICROSEC;
         lua_pushinteger(L, record_time);
         dump_call_path(L, context->callpath);
