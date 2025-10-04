@@ -5,6 +5,8 @@ package.cpath = package.cpath .. ";" .. root .. "?.so"
 local profile = require "profile"
 local json = require "json"
 
+local g_storage = {}
+
 local function test3()
     local t = {}
     local s = 0
@@ -29,8 +31,15 @@ local function test_vccl()
     return acc
 end
 
+local function test_storage()
+    for i = 1, 1000000 do
+        table.insert(g_storage, i)
+    end
+end
+
 local function test1()
     profile.start()
+    test_storage()
     tonumber("123")    
     print("111")
     tonumber("234")
@@ -42,4 +51,8 @@ local function test1()
     print(strResult)
 end
 
-test1()
+local function test()
+    test1()
+end
+
+test()

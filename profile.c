@@ -411,6 +411,12 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         }
 
         // 维护映射与大小；若地址搬移，迁移键
+        // 准备“当前叶子节点”，用于 last-alloc-wins 归因
+        struct call_state* cur_cs = context->cur_cs;
+        struct call_frame* cur_frame = (cur_cs ? cur_callframe(cur_cs) : NULL);
+        struct callpath_node* leaf_node = (cur_frame && cur_frame->path) ?
+            (struct callpath_node*)icallpath_getvalue(cur_frame->path) : NULL;
+
         if (alloc_ret != ptr && alloc_ret != NULL) {
             struct alloc_node* an_move = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (an_move == NULL) {
@@ -420,10 +426,20 @@ _resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
                 an_move->alloc_size = 0;
             }
             an_move->alloc_size = newsize;
+            // realloc 搬移后，采用 last-alloc-wins：更新归因路径为当前叶子
+            if (leaf_node && (newsize >= old)) {
+                an_move->path = leaf_node;
+            }
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an_move);
         } else {
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (an) an->alloc_size = newsize;
+            if (an) {
+                an->alloc_size = newsize;
+                // in-place grow：更新归因路径为当前叶子
+                if (leaf_node && add_bytes) {
+                    an->path = leaf_node;
+                }
+            }
         }
     }
 
@@ -601,6 +617,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t count = node->count > child_arg.count ? node->count : child_arg.count;
     uint64_t rt = realtime(node->record_time) * MICROSEC;
     uint64_t record_time = rt > child_arg.record_time ? rt : child_arg.record_time;
+    uint64_t inuse_bytes = node->alloc_bytes >= node->free_bytes ? node->alloc_bytes-node->free_bytes : 9999999999;
 
     arg->record_time += record_time;
     arg->count += count;
@@ -627,6 +644,8 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_setfield(arg->L, -2, "alloc_times");
     lua_pushinteger(arg->L, (lua_Integer)node->free_times);
     lua_setfield(arg->L, -2, "free_times");
+    lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
+    lua_setfield(arg->L, -2, "inuse_bytes");
 }
 
 static void dump_call_path(lua_State* L, struct icallpath_context* path) {
