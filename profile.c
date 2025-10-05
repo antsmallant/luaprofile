@@ -72,6 +72,7 @@ struct profile_context {
     uint64_t    free_bytes_total;
     uint64_t    alloc_times_total;
     uint64_t    free_times_total;
+    uint64_t    realloc_times_total;
     lua_Alloc   last_alloc_f;
     void*       last_alloc_ud;
     struct imap_context*        cs_map;
@@ -94,15 +95,12 @@ struct callpath_node {
     uint64_t free_bytes;
     uint64_t alloc_times;
     uint64_t free_times;
+    uint64_t realloc_times;
 };
 
-// 账本段：记录一次增长对某路径的字节贡献
-struct alloc_seg { struct callpath_node* path; size_t bytes; };
-#define MAX_ALLOC_SEGS 32
 struct alloc_node {
-    size_t live;                // 当前存活字节
-    int seg_count;              // 段数量
-    struct alloc_seg segs[MAX_ALLOC_SEGS];
+    size_t live_bytes;                // 当前存活字节
+    struct callpath_node* path;       // 当前所有权路径
 };
 
 struct symbol_info {
@@ -126,15 +124,15 @@ callpath_node_create() {
     node->free_bytes = 0;
     node->alloc_times = 0;
     node->free_times = 0;
+    node->realloc_times = 0;
     return node;
 }
 
 static struct alloc_node*
 alloc_node_create() {
     struct alloc_node* node = (struct alloc_node*)pmalloc(sizeof(*node));
-    node->live = 0;
-    node->seg_count = 0;
-    for (int i = 0; i < MAX_ALLOC_SEGS; ++i) { node->segs[i].path = NULL; node->segs[i].bytes = 0; }
+    node->live_bytes = 0;
+    node->path = NULL;
     return node;
 }
 
@@ -175,6 +173,7 @@ profile_create() {
     context->free_bytes_total = 0;
     context->alloc_times_total = 0;
     context->free_times_total = 0;
+    context->realloc_times_total = 0;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     return context;
@@ -231,7 +230,7 @@ get_profile_context(lua_State* L) {
     lua_pushlightuserdata(L, &profile_context_key);
     lua_rawget(L, LUA_REGISTRYINDEX);
     ctx = (struct profile_context*)lua_touserdata(L, -1);
-    lua_pop(L, 1);
+        lua_pop(L, 1);
     return ctx;
 }
 
@@ -281,24 +280,24 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         if (!si) {
             lua_getinfo(co, "nSl", far);
             const char* name = far->name;
-            int line = far->linedefined;
-            const char* source = far->source;
-            char flag = far->what[0];
-            if (flag == 'C') {
-                lua_Debug ar2;
-                int i=0;
-                int ret = 0;
-                do {
-                    i++;
-                    ret = lua_getstack(co, i, &ar2);
-                    if(ret) {
-                        lua_getinfo(co, "Sl", &ar2);
-                        if(ar2.what[0] != 'C') {
-                            line = ar2.currentline;
-                            source = ar2.source;
-                            break;
-                        }
+        int line = far->linedefined;
+        const char* source = far->source;
+        char flag = far->what[0];
+        if (flag == 'C') {
+            lua_Debug ar2;
+            int i=0;
+            int ret = 0;
+            do {
+                i++;
+                ret = lua_getstack(co, i, &ar2);
+                if(ret) {
+                    lua_getinfo(co, "Sl", &ar2);
+                    if(ar2.what[0] != 'C') {
+                        line = ar2.currentline;
+                        source = ar2.source;
+                        break;
                     }
+                }
                 } while(ret);
             }
             si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
@@ -315,20 +314,21 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     return cur_path;
 }
 
-// 将增量累加到一条父链（包含起点）
-static inline void _accumulate_on_path(struct callpath_node* node,
-    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times) {
+// 按路径更新节点
+static inline void _mem_accumulate_on_path(struct callpath_node* node,
+    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times, uint64_t realloc_times) {
     for (struct callpath_node* n = node; n != NULL; n = n->parent) {
         if (add_bytes) n->alloc_bytes += add_bytes;
         if (add_times) n->alloc_times += add_times;
         if (sub_bytes) n->free_bytes += sub_bytes;
         if (sub_times) n->free_times += sub_times;
+        if (realloc_times) n->realloc_times += realloc_times;
     }
 }
 
-// 将增量累加到当前调用栈的所有帧（inclusive）
-static inline void _accumulate_on_stack(struct profile_context* context,
-    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times) {
+// 按栈更新节点
+static inline void _mem_accumulate_on_stack(struct profile_context* context,
+    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times, uint64_t realloc_times) {
     struct call_state* cs = context->cur_cs;
     if (!cs || cs->top <= 0) return;
     for (int i = 0; i < cs->top; i++) {
@@ -340,6 +340,7 @@ static inline void _accumulate_on_stack(struct profile_context* context,
         if (add_times) n->alloc_times += add_times;
         if (sub_bytes) n->free_bytes += sub_bytes;
         if (sub_times) n->free_times += sub_times;
+        if (realloc_times) n->realloc_times += realloc_times;
     }
 }
 
@@ -353,150 +354,102 @@ static inline struct callpath_node* _current_leaf_node(struct profile_context* c
 }
 
 static void*
-_resolve_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {   
+_resolve_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
-    void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, osize, nsize);
+    void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, _osize, _nsize);
     if (context->running_in_hook || !context->is_ready) {
         return alloc_ret;
     }
 
-    // 事件语义：
-    // - alloc:  osize==0 && nsize>0
-    // - free:   osize>0 && nsize==0
-    // - realloc osize>0 && nsize>0 → 以增量/减量计入全局与当前路径
-
-    size_t old = (ptr == NULL) ? 0 : osize;
-    size_t newsize = nsize;
+    size_t oldsize = (ptr == NULL) ? 0 : _osize;
+    size_t newsize = _nsize;
 
     // 本次事件的增量/减量
     size_t add_bytes = 0;
     size_t sub_bytes = 0;
     uint64_t add_times = 0;
     uint64_t sub_times = 0;
+    uint64_t realloc_times = 0;
 
-    if (old == 0 && newsize > 0) {
+    if (oldsize == 0 && newsize > 0) {
         // alloc
+
         add_bytes = newsize;
         add_times = 1;
-    } else if (old > 0 && newsize == 0) {
-        // free — 延后到移除映射后再确定 sub_bytes/sub_times
-    } else if (old > 0 && newsize > 0) {
-        // realloc → 仅以增量/减量计入
-        if (newsize > old) {
-            add_bytes = newsize - old;
-            add_times = 1;
-        } else if (old > newsize) {
-            sub_bytes = old - newsize;
-            sub_times = 1;
-        }
-    }
 
-    // 维护活跃映射与按路径/按栈累加（delta-based：tcmalloc/jemalloc 风格）
-    if (old == 0 && newsize > 0) {
-        // [alloc] 归因当前栈（inclusive），建立/更新映射
-        _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
+        // 按栈更新节点
+        _mem_accumulate_on_stack(context, add_bytes, add_times, 0, 0, 0);
 
+        // 创建映射
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
         if (an == NULL) an = alloc_node_create();
-        an->live = newsize;
-        an->seg_count = 0;
-        // 记录一次完整增长段（叶子路径）
-        struct callpath_node* leaf = _current_leaf_node(context);
-        if (leaf && newsize > 0) {
-            int k = an->seg_count < MAX_ALLOC_SEGS ? an->seg_count : (MAX_ALLOC_SEGS - 1);
-            if (an->seg_count < MAX_ALLOC_SEGS) an->seg_count++;
-            an->segs[k].path = leaf;
-            an->segs[k].bytes = newsize;
-        }
+        an->live_bytes = newsize;
+        an->path = _current_leaf_node(context);
         imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
 
-    } else if (old > 0 && newsize == 0) {
-        // [free] 归因指针当前保存的上下文（沿父链回溯），删除映射
+    } else if (oldsize > 0 && newsize == 0) {
+        // free
+        
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
-            size_t need = an->live;
-            // LIFO 段回退
-            while (need > 0 && an->seg_count > 0) {
-                int k = an->seg_count - 1;
-                size_t take = an->segs[k].bytes <= need ? an->segs[k].bytes : need;
-                if (take > 0 && an->segs[k].path) _accumulate_on_path(an->segs[k].path, 0, 0, take, 1);
-                an->segs[k].bytes -= take;
-                need -= take;
-                if (an->segs[k].bytes == 0) an->seg_count--;
+            sub_bytes = an->live_bytes; 
+            sub_times = (an->live_bytes ? 1 : 0);
+            // 按路径更新节点
+            if (an->path && an->live_bytes > 0) {
+                _mem_accumulate_on_path(an->path, 0, 0, sub_bytes, sub_times, 0);
             }
-            sub_bytes = an->live; sub_times = (an->live ? 1 : 0);
-            an->live = 0;
             pfree(an);
         }
 
-    } else if (old > 0 && newsize > 0) {
-        // [realloc] 拆为增长/收缩的 delta：grow 归因“当前栈”；shrink 归因“旧上下文”；同时维护映射
-        struct callpath_node* leaf_node = _current_leaf_node(context);
-        // 1) 计量 + 账本
-        if (add_bytes) {
-            _accumulate_on_stack(context, add_bytes, add_times, 0, 0);
-        }
+    } else if (oldsize > 0 && newsize > 0) {
+        // realloc
+        // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
+        // 1、旧 node，free_bytes 加上 oldsizesize，free_times 不加，by_path 传播给父节点；
+        // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1，by_stack 传播给父节点；
+
+        add_bytes = newsize;
+        sub_bytes = oldsize;
+        realloc_times = 1;
+
+        // 旧路径：free_bytes += oldsize
         if (sub_bytes) {
             struct alloc_node* anq = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (anq) {
-                size_t need = sub_bytes;
-                // LIFO 段回退
-                while (need > 0 && anq->seg_count > 0) {
-                    int k = anq->seg_count - 1;
-                    size_t take = anq->segs[k].bytes <= need ? anq->segs[k].bytes : need;
-                    if (take > 0 && anq->segs[k].path) _accumulate_on_path(anq->segs[k].path, 0, 0, take, 1);
-                    anq->segs[k].bytes -= take;
-                    need -= take;
-                    if (anq->segs[k].bytes == 0) anq->seg_count--;
-                }
+            if (anq && anq->path) {
+                _mem_accumulate_on_path(anq->path, 0, 0, sub_bytes, 0, 0);
             }
         }
 
-        // 2) 映射（live 与段）
+        // 新路径：alloc_bytes += newsize；realloc_times += 1
+        if (add_bytes) {
+            _mem_accumulate_on_stack(context, add_bytes, 0, 0, 0, 1);
+        }
+
+        // 更新映射（搬移或原地）
+        struct callpath_node* leaf_node = _current_leaf_node(context);   
         if (alloc_ret != ptr && alloc_ret != NULL) {
-            // 搬移：取旧记录→更新 live/段→写入新键
             struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (an == NULL) an = alloc_node_create();
-            // 增长段追加
-            if (add_bytes && leaf_node) {
-                int k = (an->seg_count > 0 && an->segs[an->seg_count-1].path == leaf_node)
-                        ? (an->seg_count-1) : (an->seg_count < MAX_ALLOC_SEGS ? an->seg_count++ : an->seg_count-1);
-                an->segs[k].path = leaf_node;
-                an->segs[k].bytes += add_bytes;
-            }
-            an->live = newsize;
+            if (!an) an = alloc_node_create();
+            an->live_bytes = newsize;
+            an->path = leaf_node;
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
         } else {
-            // 原地：更新 live；增长段追加
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (an) {
-                if (add_bytes && leaf_node) {
-                    int k = (an->seg_count > 0 && an->segs[an->seg_count-1].path == leaf_node)
-                            ? (an->seg_count-1) : (an->seg_count < MAX_ALLOC_SEGS ? an->seg_count++ : an->seg_count-1);
-                    an->segs[k].path = leaf_node;
-                    an->segs[k].bytes += add_bytes;
-                }
-                an->live = newsize;
-            } else {
-                // 兜底：缺记录则补建，写入增长段
-                an = alloc_node_create();
-                an->live = newsize;
-                an->seg_count = 0;
-                if (add_bytes && leaf_node) {
-                    int k = an->seg_count < MAX_ALLOC_SEGS ? an->seg_count++ : (MAX_ALLOC_SEGS - 1);
-                    an->segs[k].path = leaf_node;
-                    an->segs[k].bytes = add_bytes;
-                }
-                imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
-            }
+            bool exists = (an != NULL);
+            if (!an) an = alloc_node_create();
+            an->live_bytes = newsize;
+            an->path = leaf_node;
+            if (!exists) imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
         }
+
+        printf("realloc: %p -> %p, %zu -> %zu\n", ptr, alloc_ret, oldsize, newsize);
     }
 
-    // 全局累计（在最终确定 add/sub 后）
+    // 全局累计
     if (add_bytes) context->alloc_bytes_total += add_bytes;
     if (add_times) context->alloc_times_total += add_times;
     if (sub_bytes) context->free_bytes_total += sub_bytes;
     if (sub_times) context->free_times_total += sub_times;
+    if (realloc_times) context->realloc_times_total += realloc_times;
 
     return alloc_ret;
 }
@@ -693,6 +646,8 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_setfield(arg->L, -2, "alloc_times");
     lua_pushinteger(arg->L, (lua_Integer)node->free_times);
     lua_setfield(arg->L, -2, "free_times");
+    lua_pushinteger(arg->L, (lua_Integer)node->realloc_times);
+    lua_setfield(arg->L, -2, "realloc_times");
     lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
     lua_setfield(arg->L, -2, "inuse_bytes");
 }
@@ -805,7 +760,7 @@ _lunmark(lua_State* L) {
     if (context == NULL) {
         printf("unmark fail, profile not started\n");
         return 0;
-    }    
+    }
     lua_State* co = lua_tothread(L, 1);
     if(co == NULL) {
         co = L;
@@ -827,6 +782,7 @@ _ldump(lua_State* L) {
         node->free_bytes = context->free_bytes_total;
         node->alloc_times = context->alloc_times_total;
         node->free_times = context->free_times_total;
+        node->realloc_times = context->realloc_times_total;
         uint64_t record_time = realtime(gettime() - context->start_time) * MICROSEC;
         lua_pushinteger(L, record_time);
         dump_call_path(L, context->callpath);
