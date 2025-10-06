@@ -63,7 +63,7 @@ struct call_state {
     lua_State*  co;
     uint64_t    leave_time; // co yield begin time
     int         top;
-    struct call_frame   call_list[0];
+    struct call_frame call_list[0];
 };
 
 struct profile_context {
@@ -86,7 +86,7 @@ struct callpath_node {
     int     line;
     int     depth;
     uint64_t last_ret_time;
-    uint64_t count;
+    uint64_t call_count;
     uint64_t real_cost;
     uint64_t alloc_bytes;
     uint64_t free_bytes;
@@ -115,7 +115,7 @@ callpath_node_create() {
     node->line = 0;
     node->depth = 0;
     node->last_ret_time = 0;
-    node->count = 0;
+    node->call_count = 0;
     node->real_cost = 0;
     node->alloc_bytes = 0;
     node->free_bytes = 0;
@@ -244,7 +244,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         struct callpath_node* node = callpath_node_create();
         node->name = "root";
         node->source = node->name;
-        node->count = 1;
+        node->call_count = 1;
         context->callpath = icallpath_create(0, node);
     }
     if (!pre_path) {
@@ -262,7 +262,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         node->depth = path_parent->depth + 1;
         node->last_ret_time = 0;
         node->real_cost = 0;
-        node->count = 0;
+        node->call_count = 0;
         cur_path = icallpath_add_child(pre_path, k, node);
     }
 
@@ -526,7 +526,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
         if (frame->path) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
-            ++node->count;
+            ++node->call_count;
         }
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
@@ -608,7 +608,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
     uint64_t real_cost = node->real_cost + child_arg.real_cost;
     // 本节点的其他指标
-    uint64_t count = node->count;
+    uint64_t call_count = node->call_count;
     uint64_t inuse_bytes = alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999;
 
     // 累加到父节点
@@ -625,7 +625,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushstring(arg->L, name);
     lua_setfield(arg->L, -2, "name");
 
-    lua_pushinteger(arg->L, count);
+    lua_pushinteger(arg->L, call_count);
     lua_setfield(arg->L, -2, "call_count");
 
     lua_pushinteger(arg->L, real_cost);
