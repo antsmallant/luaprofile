@@ -30,7 +30,6 @@ function M.start()
     end
     g_profile_started = true
     c.start()
-    collectgarbage("collect")
     coroutine.create = my_coroutine_create
     coroutine.wrap = my_coroutine_wrap
 end
@@ -42,7 +41,6 @@ function M.stop()
     end
     coroutine.create = old_co_create
     coroutine.wrap = old_co_wrap    
-    collectgarbage("collect")
     local record_time, nodes = c.dump()
     c.stop()
     g_profile_started = false
