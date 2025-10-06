@@ -404,13 +404,14 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
+            // 更新节点
             size_t sub_bytes = an->live_bytes; 
             uint64_t sub_times = (an->live_bytes ? 1 : 0);
-            // 更新节点
             if (an->path && an->live_bytes > 0) {
                 _mem_update_on_path(an->path, 0, 0, sub_bytes, sub_times, 0);
             }
             pfree(an);
+            an = NULL;
         }
 
     } else if (oldsize > 0 && newsize > 0) {
