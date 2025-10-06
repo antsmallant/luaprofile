@@ -282,24 +282,24 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         if (!si) {
             lua_getinfo(co, "nSl", far);
             const char* name = far->name;
-        int line = far->linedefined;
-        const char* source = far->source;
-        char flag = far->what[0];
-        if (flag == 'C') {
-            lua_Debug ar2;
-            int i=0;
-            int ret = 0;
-            do {
-                i++;
-                ret = lua_getstack(co, i, &ar2);
-                if(ret) {
-                    lua_getinfo(co, "Sl", &ar2);
-                    if(ar2.what[0] != 'C') {
-                        line = ar2.currentline;
-                        source = ar2.source;
-                        break;
+            int line = far->linedefined;
+            const char* source = far->source;
+            char flag = far->what[0];
+            if (flag == 'C') {
+                lua_Debug ar2;
+                int i=0;
+                int ret = 0;
+                do {
+                    i++;
+                    ret = lua_getstack(co, i, &ar2);
+                    if(ret) {
+                        lua_getinfo(co, "Sl", &ar2);
+                        if(ar2.what[0] != 'C') {
+                            line = ar2.currentline;
+                            source = ar2.source;
+                            break;
+                        }
                     }
-                }
                 } while(ret);
             }
             si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
