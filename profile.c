@@ -66,13 +66,6 @@ struct profile_context {
     uint64_t    start_time;
     bool        is_ready; // 是否就绪
     bool        running_in_hook;  // 是否正在运行 hook 逻辑
-
-    // 全局内存统计
-    uint64_t    alloc_bytes_total;
-    uint64_t    free_bytes_total;
-    uint64_t    alloc_times_total;
-    uint64_t    free_times_total;
-    uint64_t    realloc_times_total;
     lua_Alloc   last_alloc_f;
     void*       last_alloc_ud;
     struct imap_context*        cs_map;
@@ -169,11 +162,6 @@ profile_create() {
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->running_in_hook = false;
-    context->alloc_bytes_total = 0;
-    context->free_bytes_total = 0;
-    context->alloc_times_total = 0;
-    context->free_times_total = 0;
-    context->realloc_times_total = 0;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     return context;
@@ -314,16 +302,15 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     return cur_path;
 }
 
-// 按路径更新节点
-static inline void _mem_accumulate_on_path(struct callpath_node* node,
+// 按路径更新节点（仅更新当前节点的 self 计数，父链累计推迟到 dump 聚合）
+static inline void _mem_update_on_path(struct callpath_node* node,
     size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times, uint64_t realloc_times) {
-    for (struct callpath_node* n = node; n != NULL; n = n->parent) {
-        if (add_bytes) n->alloc_bytes += add_bytes;
-        if (add_times) n->alloc_times += add_times;
-        if (sub_bytes) n->free_bytes += sub_bytes;
-        if (sub_times) n->free_times += sub_times;
-        if (realloc_times) n->realloc_times += realloc_times;
-    }
+    if (!node) return;
+    if (add_bytes) node->alloc_bytes += add_bytes;
+    if (add_times) node->alloc_times += add_times;
+    if (sub_bytes) node->free_bytes += sub_bytes;
+    if (sub_times) node->free_times += sub_times;
+    if (realloc_times) node->realloc_times += realloc_times;
 }
 
 // 取当前栈的叶子节点
@@ -398,7 +385,6 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
     size_t sub_bytes = 0;
     uint64_t add_times = 0;
     uint64_t sub_times = 0;
-    uint64_t realloc_times = 0;
 
     if (oldsize == 0 && newsize > 0) {
         // alloc
@@ -408,7 +394,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
 
         // 更新节点
         struct callpath_node* leaf = _current_leaf_node(context);
-        if (leaf) _mem_accumulate_on_path(leaf, add_bytes, add_times, 0, 0, 0);
+        if (leaf) _mem_update_on_path(leaf, add_bytes, add_times, 0, 0, 0);
 
         // 创建映射
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
@@ -426,7 +412,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
             sub_times = (an->live_bytes ? 1 : 0);
             // 更新节点
             if (an->path && an->live_bytes > 0) {
-                _mem_accumulate_on_path(an->path, 0, 0, sub_bytes, sub_times, 0);
+                _mem_update_on_path(an->path, 0, 0, sub_bytes, sub_times, 0);
             }
             pfree(an);
         }
@@ -439,20 +425,20 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1，by_stack 传播给父节点；
         add_bytes = newsize;
         sub_bytes = oldsize;
-        realloc_times = 1;
+        /* realloc_times accounted directly in _mem_update_on_path call below */
 
         // 旧路径：free_bytes += oldsize
         if (sub_bytes) {
-            struct alloc_node* anq = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (anq && anq->path) {
-                _mem_accumulate_on_path(anq->path, 0, 0, sub_bytes, 0, 0);
+            struct alloc_node* old_an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+            if (old_an && old_an->path) {
+                _mem_update_on_path(old_an->path, 0, 0, sub_bytes, 0, 0);
             }
         }
 
         // 新路径：alloc_bytes += newsize；realloc_times += 1
         if (add_bytes) {
             struct callpath_node* leaf = _current_leaf_node(context);
-            if (leaf) _mem_accumulate_on_path(leaf, add_bytes, 0, 0, 0, 1);
+            if (leaf) _mem_update_on_path(leaf, add_bytes, 0, 0, 0, 1);
         }
 
         // 更新映射（搬移或原地）
@@ -465,19 +451,14 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         } else {
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             bool exists = (an != NULL);
-            if (!an) an = alloc_node_create();
+            if (!exists) an = alloc_node_create();
             an->live_bytes = newsize;
             an->path = _current_leaf_node(context);
             if (!exists) imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
         }
     }
 
-    // 全局累计
-    if (add_bytes) context->alloc_bytes_total += add_bytes;
-    if (add_times) context->alloc_times_total += add_times;
-    if (sub_bytes) context->free_bytes_total += sub_bytes;
-    if (sub_times) context->free_times_total += sub_times;
-    if (realloc_times) context->realloc_times_total += realloc_times;
+    // 全局累计移除：改用 dump 时从树聚合
 
     return alloc_ret;
 }
@@ -571,6 +552,12 @@ struct dump_call_path_arg {
     uint64_t record_time;
     uint64_t count;
     uint64_t index;
+    // children aggregation (sum of inclusive values of all direct children)
+    uint64_t alloc_bytes_sum;
+    uint64_t free_bytes_sum;
+    uint64_t alloc_times_sum;
+    uint64_t free_times_sum;
+    uint64_t realloc_times_sum;
 };
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
@@ -579,6 +566,15 @@ static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
     struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
     _dump_call_path((struct icallpath_context*)value, arg);
     lua_seti(arg->L, -2, ++arg->index);
+    // accumulate child's inclusive metrics into parent arg sums
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue((struct icallpath_context*)value);
+    if (node) {
+        arg->alloc_bytes_sum += node->alloc_bytes;
+        arg->free_bytes_sum += node->free_bytes;
+        arg->alloc_times_sum += node->alloc_times;
+        arg->free_times_sum += node->free_times;
+        arg->realloc_times_sum += node->realloc_times;
+    }
 }
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg) {
@@ -590,6 +586,11 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     child_arg.record_time = 0;
     child_arg.count = 0;
     child_arg.index = 0;
+    child_arg.alloc_bytes_sum = 0;
+    child_arg.free_bytes_sum = 0;
+    child_arg.alloc_times_sum = 0;
+    child_arg.free_times_sum = 0;
+    child_arg.realloc_times_sum = 0;
 
     if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
@@ -598,13 +599,27 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    // 计算 inclusive：统一为 self + children_sum（root 也聚合子节点）
+    uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
+    uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
+    uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
+    uint64_t free_times_incl = node->free_times + child_arg.free_times_sum;
+    uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
+
     uint64_t count = node->count > child_arg.count ? node->count : child_arg.count;
     uint64_t rt = realtime(node->record_time) * MICROSEC;
     uint64_t record_time = rt > child_arg.record_time ? rt : child_arg.record_time;
-    uint64_t inuse_bytes = node->alloc_bytes >= node->free_bytes ? node->alloc_bytes-node->free_bytes : 9999999999;
+    uint64_t inuse_bytes = alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999;
 
     arg->record_time += record_time;
     arg->count += count;
+
+    // 将 inclusive 写回 node
+    node->alloc_bytes = alloc_bytes_incl;
+    node->free_bytes = free_bytes_incl;
+    node->alloc_times = alloc_times_incl;
+    node->free_times = free_times_incl;
+    node->realloc_times = realloc_times_incl;
 
     char name[512] = {0};
     snprintf(name, sizeof(name)-1, "%s %s:%d", node->name ? node->name : "", node->source ? node->source : "", node->line);
@@ -620,19 +635,19 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, node->ret_time);
     lua_setfield(arg->L, -2, "rettime");
 
-    lua_pushinteger(arg->L, (lua_Integer)node->alloc_bytes);
+    lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
     lua_setfield(arg->L, -2, "alloc_bytes");
 
-    lua_pushinteger(arg->L, (lua_Integer)node->free_bytes);
+    lua_pushinteger(arg->L, (lua_Integer)free_bytes_incl);
     lua_setfield(arg->L, -2, "free_bytes");
 
-    lua_pushinteger(arg->L, (lua_Integer)node->alloc_times);
+    lua_pushinteger(arg->L, (lua_Integer)alloc_times_incl);
     lua_setfield(arg->L, -2, "alloc_times");
 
-    lua_pushinteger(arg->L, (lua_Integer)node->free_times);
+    lua_pushinteger(arg->L, (lua_Integer)free_times_incl);
     lua_setfield(arg->L, -2, "free_times");
 
-    lua_pushinteger(arg->L, (lua_Integer)node->realloc_times);
+    lua_pushinteger(arg->L, (lua_Integer)realloc_times_incl);
     lua_setfield(arg->L, -2, "realloc_times");
 
     lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
@@ -764,12 +779,7 @@ _ldump(lua_State* L) {
         // stop gc before dump
         int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
         if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }        
-        struct callpath_node* node = icallpath_getvalue(context->callpath);
-        node->alloc_bytes = context->alloc_bytes_total;
-        node->free_bytes = context->free_bytes_total;
-        node->alloc_times = context->alloc_times_total;
-        node->free_times = context->free_times_total;
-        node->realloc_times = context->realloc_times_total;
+        // 根节点值由自底向上的聚合结果产生，无需覆盖
         uint64_t record_time = realtime(gettime() - context->start_time) * MICROSEC;
         lua_pushinteger(L, record_time);
         dump_call_path(L, context->callpath);
