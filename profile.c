@@ -67,7 +67,7 @@ struct profile_context {
     bool        is_ready; // 是否就绪
     bool        running_in_hook;  // 是否正在运行 hook 逻辑
 
-    // 全局内存统计（仅按 alloc/free 维度聚合；realloc 记为增量/减量）
+    // 全局内存统计
     uint64_t    alloc_bytes_total;
     uint64_t    free_bytes_total;
     uint64_t    alloc_times_total;
@@ -344,7 +344,7 @@ static inline void _mem_accumulate_on_stack(struct profile_context* context,
     }
 }
 
-// 取当前栈的叶子节点（用于 last-alloc-wins 路径归因）
+// 取当前栈的叶子节点
 static inline struct callpath_node* _current_leaf_node(struct profile_context* context) {
     struct call_state* cs = context->cur_cs;
     if (!cs) return NULL;
@@ -353,8 +353,55 @@ static inline struct callpath_node* _current_leaf_node(struct profile_context* c
     return (struct callpath_node*)icallpath_getvalue(leaf->path);
 }
 
+/*
+获取所有类型的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
+如果没有正确获取 prototype，那么像 tonumber 和 print 这类 LUA_VLCF 使用栈上的函数指针来充当 prototype,
+会导致同一层的这类函数被合并为同一个节点，比如下面的代码，最终 print 会错误的合并到 tonumber 的节点中，显示为
+2 次 tonumber 调用。 
+
+验证代码:
+local function test1()
+    local profile = require "profile"
+    local json = require "cjson"
+    profile.start()
+    tonumber("123")    
+    print("111")
+    local result = profile.stop()
+    skynet.error("test1:", json.encode(result))
+end
+test1()
+
+结果可用 https://jsongrid.com/ 查看
+*/
+static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
+    const void* proto = NULL;
+    if (ar->i_ci && ar->i_ci->func.p) {
+        const TValue* tv = s2v(ar->i_ci->func.p);
+        if (ttislcf(tv)) {
+            // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
+            proto = (const void*)fvalue(tv);
+        } else if (ttisclosure(tv)) {
+            const Closure* cl = clvalue(tv);
+            if (cl->c.tt == LUA_VLCL) {
+                proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
+            } else if (cl->c.tt == LUA_VCCL) {
+                proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
+            }
+        }
+    }
+    if (!proto) {
+        // 兜底：仍可能遇到少数拿不到 TValue 的情况
+        lua_getinfo(L, "f", ar);
+        proto = lua_topointer(L, -1);
+        lua_pop(L, 1);
+        printf("get prototype by getinfo: %p\n", proto);
+    }
+    return proto;
+}
+
+// hook alloc/free/realloc 事件
 static void*
-_resolve_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {   
+_hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {   
     struct profile_context* context = (struct profile_context*)ud;
     void* alloc_ret = context->last_alloc_f(context->last_alloc_ud, ptr, _osize, _nsize);
     if (context->running_in_hook || !context->is_ready) {
@@ -403,10 +450,10 @@ _resolve_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
 
     } else if (oldsize > 0 && newsize > 0) {
         // realloc
+        
         // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
         // 1、旧 node，free_bytes 加上 oldsizesize，free_times 不加，by_path 传播给父节点；
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1，by_stack 传播给父节点；
-
         add_bytes = newsize;
         sub_bytes = oldsize;
         realloc_times = 1;
@@ -440,8 +487,6 @@ _resolve_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
             an->path = leaf_node;
             if (!exists) imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
         }
-
-        printf("realloc: %p -> %p, %zu -> %zu\n", ptr, alloc_ret, oldsize, newsize);
     }
 
     // 全局累计
@@ -454,54 +499,9 @@ _resolve_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
     return alloc_ret;
 }
 
-/*
-获取所有类型的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
-如果没有正确获取 prototype，那么像 tonumber 和 print 这类 LUA_VLCF 使用栈上的函数指针来充当 prototype,
-会导致同一层的这类函数被合并为同一个节点，比如下面的代码，最终 print 会错误的合并到 tonumber 的节点中，显示为
-2 次 tonumber 调用。 
-
-验证代码:
-local function test1()
-    local profile = require "profile"
-    local json = require "cjson"
-    profile.start()
-    tonumber("123")    
-    print("111")
-    local result = profile.stop()
-    skynet.error("test1:", json.encode(result))
-end
-test1()
-
-结果可用 https://jsongrid.com/ 查看
-*/
-static const void* get_prototype(lua_State* L, lua_Debug* ar) {
-    const void* proto = NULL;
-    if (ar->i_ci && ar->i_ci->func.p) {
-        const TValue* tv = s2v(ar->i_ci->func.p);
-        if (ttislcf(tv)) {
-            // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
-            proto = (const void*)fvalue(tv);
-        } else if (ttisclosure(tv)) {
-            const Closure* cl = clvalue(tv);
-            if (cl->c.tt == LUA_VLCL) {
-                proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
-            } else if (cl->c.tt == LUA_VCCL) {
-                proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
-            }
-        }
-    }
-    if (!proto) {
-        // 兜底：仍可能遇到少数拿不到 TValue 的情况
-        lua_getinfo(L, "f", ar);
-        proto = lua_topointer(L, -1);
-        lua_pop(L, 1);
-        printf("get prototype by getinfo: %p\n", proto);
-    }
-    return proto;
-}
-
+// hook call/ret 事件
 static void
-_resolve_hook(lua_State* L, lua_Debug* far) {
+_hook_call(lua_State* L, lua_Debug* far) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("resolve hook fail, profile not started\n");
@@ -511,8 +511,9 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         return;
     }
 
-    uint64_t cur_time = gettime();
     context->running_in_hook = true;
+
+    uint64_t cur_time = gettime();
     int event = far->event;
     struct call_state* cs = context->cur_cs;
     if (!context->cur_cs || context->cur_cs->co != L) {
@@ -553,7 +554,7 @@ _resolve_hook(lua_State* L, lua_Debug* far) {
         frame->tail = (event == LUA_HOOKTAILCALL);
         frame->sub_cost = 0;
         frame->call_time = cur_time;
-        frame->prototype = get_prototype(L, far);    
+        frame->prototype = _get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
@@ -588,7 +589,6 @@ struct dump_call_path_arg {
     uint64_t record_time;
     uint64_t count;
     uint64_t index;
-    // 兼容旧字段移除：不再统计 alloc_count
 };
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
@@ -640,14 +640,19 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     lua_pushinteger(arg->L, (lua_Integer)node->alloc_bytes);
     lua_setfield(arg->L, -2, "alloc_bytes");
+
     lua_pushinteger(arg->L, (lua_Integer)node->free_bytes);
     lua_setfield(arg->L, -2, "free_bytes");
+
     lua_pushinteger(arg->L, (lua_Integer)node->alloc_times);
     lua_setfield(arg->L, -2, "alloc_times");
+
     lua_pushinteger(arg->L, (lua_Integer)node->free_times);
     lua_setfield(arg->L, -2, "free_times");
+
     lua_pushinteger(arg->L, (lua_Integer)node->realloc_times);
     lua_setfield(arg->L, -2, "realloc_times");
+    
     lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
     lua_setfield(arg->L, -2, "inuse_bytes");
 }
@@ -689,7 +694,7 @@ _lstart(lua_State* L) {
     context->is_ready = true;
     context->running_in_hook = true;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    lua_setallocf(L, _resolve_alloc, context);
+    lua_setallocf(L, _hook_alloc, context);
     set_profile_context(L, context);
 
     // stop gc before set hook
@@ -698,7 +703,7 @@ _lstart(lua_State* L) {
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
-        lua_sethook(states[i], _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
+        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
 
@@ -748,7 +753,7 @@ _lmark(lua_State* L) {
         co = L;
     }
     if(context->is_ready) {
-        lua_sethook(co, _resolve_hook, LUA_MASKCALL | LUA_MASKRET, 0);
+        lua_sethook(co, _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
     }
     lua_pushboolean(L, context->is_ready);
     return 1;
