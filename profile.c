@@ -309,12 +309,12 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
 
 // 按路径更新节点（仅更新当前节点的 self 计数，父链累计推迟到 dump 聚合）
 static inline void _mem_update_on_path(struct callpath_node* node,
-    size_t add_bytes, uint64_t add_times, size_t sub_bytes, uint64_t sub_times, uint64_t realloc_times) {
+    size_t alloc_bytes, uint64_t alloc_times, size_t free_bytes, uint64_t free_times, uint64_t realloc_times) {
     if (!node) return;
-    if (add_bytes) node->alloc_bytes += add_bytes;
-    if (add_times) node->alloc_times += add_times;
-    if (sub_bytes) node->free_bytes += sub_bytes;
-    if (sub_times) node->free_times += sub_times;
+    if (alloc_bytes) node->alloc_bytes += alloc_bytes;
+    if (alloc_times) node->alloc_times += alloc_times;
+    if (free_bytes) node->free_bytes += free_bytes;
+    if (free_times) node->free_times += free_times;
     if (realloc_times) node->realloc_times += realloc_times;
 }
 
@@ -385,21 +385,12 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
     size_t oldsize = (ptr == NULL) ? 0 : _osize;
     size_t newsize = _nsize;
 
-    // 本次事件的增量/减量
-    size_t add_bytes = 0;
-    size_t sub_bytes = 0;
-    uint64_t add_times = 0;
-    uint64_t sub_times = 0;
-
     if (oldsize == 0 && newsize > 0) {
         // alloc
 
-        add_bytes = newsize;
-        add_times = 1;
-
         // 更新节点
         struct callpath_node* leaf = _current_leaf_node(context);
-        if (leaf) _mem_update_on_path(leaf, add_bytes, add_times, 0, 0, 0);
+        if (leaf) _mem_update_on_path(leaf, newsize, 1, 0, 0, 0);
 
         // 创建映射
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
@@ -413,8 +404,8 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
-            sub_bytes = an->live_bytes; 
-            sub_times = (an->live_bytes ? 1 : 0);
+            size_t sub_bytes = an->live_bytes; 
+            uint64_t sub_times = (an->live_bytes ? 1 : 0);
             // 更新节点
             if (an->path && an->live_bytes > 0) {
                 _mem_update_on_path(an->path, 0, 0, sub_bytes, sub_times, 0);
@@ -426,24 +417,21 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // realloc
         
         // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
-        // 1、旧 node，free_bytes 加上 oldsizesize，free_times 不加，by_path 传播给父节点；
-        // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1，by_stack 传播给父节点；
-        add_bytes = newsize;
-        sub_bytes = oldsize;
-        /* realloc_times accounted directly in _mem_update_on_path call below */
+        // 1、旧 node，free_bytes 加上 oldsizesize；
+        // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1；
 
         // 旧路径：free_bytes += oldsize
-        if (sub_bytes) {
+        if (oldsize) {
             struct alloc_node* old_an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (old_an && old_an->path) {
-                _mem_update_on_path(old_an->path, 0, 0, sub_bytes, 0, 0);
+                _mem_update_on_path(old_an->path, 0, 0, oldsize, 0, 0);
             }
         }
 
         // 新路径：alloc_bytes += newsize；realloc_times += 1
-        if (add_bytes) {
+        if (newsize) {
             struct callpath_node* leaf = _current_leaf_node(context);
-            if (leaf) _mem_update_on_path(leaf, add_bytes, 0, 0, 0, 1);
+            if (leaf) _mem_update_on_path(leaf, newsize, 0, 0, 0, 1);
         }
 
         // 更新映射（搬移或原地）
@@ -462,8 +450,6 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
             if (!exists) imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
         }
     }
-
-    // 全局累计移除：改用 dump 时从树聚合
 
     return alloc_ret;
 }
