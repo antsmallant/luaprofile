@@ -566,21 +566,13 @@ static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
     struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
     _dump_call_path((struct icallpath_context*)value, arg);
     lua_seti(arg->L, -2, ++arg->index);
-    // accumulate child's inclusive metrics into parent arg sums
-    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue((struct icallpath_context*)value);
-    if (node) {
-        arg->alloc_bytes_sum += node->alloc_bytes;
-        arg->free_bytes_sum += node->free_bytes;
-        arg->alloc_times_sum += node->alloc_times;
-        arg->free_times_sum += node->free_times;
-        arg->realloc_times_sum += node->realloc_times;
-    }
 }
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg) {
     lua_checkstack(arg->L, 3);
     lua_newtable(arg->L);
 
+    // 递归获取所有子结点的指标和
     struct dump_call_path_arg child_arg;
     child_arg.L = arg->L;
     child_arg.record_time = 0;
@@ -591,7 +583,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     child_arg.alloc_times_sum = 0;
     child_arg.free_times_sum = 0;
     child_arg.realloc_times_sum = 0;
-
     if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
         icallpath_dump_children(path, _dump_call_path_child, &child_arg);
@@ -599,27 +590,26 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
-    // 计算 inclusive：统一为 self + children_sum（root 也聚合子节点）
+
+    // 本节点+所有子结点的指标和
     uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
     uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
     uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
     uint64_t free_times_incl = node->free_times + child_arg.free_times_sum;
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
-
     uint64_t count = node->count > child_arg.count ? node->count : child_arg.count;
     uint64_t rt = realtime(node->record_time) * MICROSEC;
     uint64_t record_time = rt > child_arg.record_time ? rt : child_arg.record_time;
     uint64_t inuse_bytes = alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999;
 
+    // 累加到父节点
     arg->record_time += record_time;
     arg->count += count;
-
-    // 将 inclusive 写回 node
-    node->alloc_bytes = alloc_bytes_incl;
-    node->free_bytes = free_bytes_incl;
-    node->alloc_times = alloc_times_incl;
-    node->free_times = free_times_incl;
-    node->realloc_times = realloc_times_incl;
+    arg->alloc_bytes_sum += alloc_bytes_incl;
+    arg->free_bytes_sum += free_bytes_incl;
+    arg->alloc_times_sum += alloc_times_incl;
+    arg->free_times_sum += free_times_incl;
+    arg->realloc_times_sum += realloc_times_incl;
 
     char name[512] = {0};
     snprintf(name, sizeof(name)-1, "%s %s:%d", node->name ? node->name : "", node->source ? node->source : "", node->line);
