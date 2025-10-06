@@ -85,7 +85,7 @@ struct callpath_node {
     const char* name;
     int     line;
     int     depth;
-    uint64_t ret_time;
+    uint64_t last_ret_time;
     uint64_t count;
     uint64_t real_cost;
     uint64_t alloc_bytes;
@@ -114,7 +114,7 @@ callpath_node_create() {
     node->name = NULL;
     node->line = 0;
     node->depth = 0;
-    node->ret_time = 0;
+    node->last_ret_time = 0;
     node->count = 0;
     node->real_cost = 0;
     node->alloc_bytes = 0;
@@ -260,7 +260,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
 
         node->parent = path_parent;
         node->depth = path_parent->depth + 1;
-        node->ret_time = 0;
+        node->last_ret_time = 0;
         node->real_cost = 0;
         node->count = 0;
         cur_path = icallpath_add_child(pre_path, k, node);
@@ -524,6 +524,10 @@ _hook_call(lua_State* L, lua_Debug* far) {
         frame->call_time = cur_time;
         frame->prototype = _get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
+        if (frame->path) {
+            struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
+            ++node->count;
+        }
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
         if (len <= 0) {
@@ -539,9 +543,8 @@ _hook_call(lua_State* L, lua_Debug* far) {
             assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
             cur_frame->ret_time = cur_time;
             cur_frame->real_cost = real_cost;
-            cur_path->ret_time = cur_path->ret_time == 0 ? cur_time : cur_path->ret_time;
+            cur_path->last_ret_time = cur_time;
             cur_path->real_cost += real_cost;
-            cur_path->count++;
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
@@ -628,7 +631,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, real_cost);
     lua_setfield(arg->L, -2, "cpu_cost_ns");
 
-    lua_pushinteger(arg->L, node->ret_time);
+    lua_pushinteger(arg->L, node->last_ret_time);
     lua_setfield(arg->L, -2, "last_ret_time");
 
     lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
@@ -787,7 +790,7 @@ _ldump(lua_State* L) {
         context->running_in_hook = true;
         uint64_t cur_time = gettime();
         struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
-        root->ret_time = cur_time;            
+        root->last_ret_time = cur_time;            
         uint64_t profile_time = cur_time - context->start_time;
         lua_pushinteger(L, profile_time);
         dump_call_path(L, context->callpath);
