@@ -591,7 +591,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
 
-    // 本节点+所有子结点的指标和
+    // 本节点的聚合指标=本节点指标+所有子结点的指标
     uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
     uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
     uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
@@ -611,6 +611,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     arg->free_times_sum += free_times_incl;
     arg->realloc_times_sum += realloc_times_incl;
 
+    // 导出本节点的聚合指标
     char name[512] = {0};
     snprintf(name, sizeof(name)-1, "%s %s:%d", node->name ? node->name : "", node->source ? node->source : "", node->line);
     lua_pushstring(arg->L, name);
