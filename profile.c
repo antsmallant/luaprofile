@@ -420,19 +420,15 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // 1、旧 node，free_bytes 加上 oldsizesize；
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1；
 
-        // 旧路径：free_bytes += oldsize
-        if (oldsize) {
-            struct alloc_node* old_an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
-            if (old_an && old_an->path) {
-                _mem_update_on_path(old_an->path, 0, 0, oldsize, 0, 0);
-            }
+        // 旧路径
+        struct alloc_node* old_an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
+        if (old_an && old_an->path) {
+            _mem_update_on_path(old_an->path, 0, 0, oldsize, 0, 0);
         }
 
-        // 新路径：alloc_bytes += newsize；realloc_times += 1
-        if (newsize) {
-            struct callpath_node* leaf = _current_leaf_node(context);
-            if (leaf) _mem_update_on_path(leaf, newsize, 0, 0, 0, 1);
-        }
+        // 新路径
+        struct callpath_node* leaf = _current_leaf_node(context);
+        if (leaf) _mem_update_on_path(leaf, newsize, 0, 0, 0, 1);
 
         // 更新映射（搬移或原地）
         if (alloc_ret != ptr && alloc_ret != NULL) {
