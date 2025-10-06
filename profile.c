@@ -252,7 +252,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     if (!context->callpath) {
         struct callpath_node* node = callpath_node_create();
         node->name = "root";
-        node->source = node->name;
+        node->source = "root";
         node->call_count = 1;
         context->callpath = icallpath_create(0, node);
     }
