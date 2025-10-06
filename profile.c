@@ -520,6 +520,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
             ++node->call_count;
         }
+
     } else if (event == LUA_HOOKRET) {
         int len = cs->top;
         if (len <= 0) {
@@ -538,7 +539,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
-        }while(tail_call);
+        } while(tail_call);
     }
 
     context->running_in_hook = false;
