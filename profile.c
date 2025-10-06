@@ -54,9 +54,7 @@ struct call_frame {
     struct icallpath_context*   path;
     bool  tail;
     uint64_t call_time;
-    uint64_t ret_time;
     uint64_t co_cost;     // co yield cost 
-    uint64_t real_cost;
 };
 
 struct call_state {
@@ -143,17 +141,6 @@ pstrdup(const char* s) {
     return d;
 }
 
-static void
-_ob_free_symbol(uint64_t key, void* value, void* ud) {
-    (void)key; (void)ud;
-    struct symbol_info* si = (struct symbol_info*)value;
-    if (si) {
-        if (si->name) pfree(si->name);
-        if (si->source) pfree(si->source);
-        pfree(si);
-    }
-}
-
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -177,6 +164,26 @@ _ob_free_call_state(uint64_t key, void* value, void* ud) {
 }
 
 static void
+_ob_free_symbol(uint64_t key, void* value, void* ud) {
+    (void)key; (void)ud;
+    struct symbol_info* si = (struct symbol_info*)value;
+    if (si) {
+        if (si->name) pfree(si->name);
+        if (si->source) pfree(si->source);
+        pfree(si);
+    }
+}
+
+static void
+_ob_free_alloc_node(uint64_t key, void* value, void* ud) {
+    (void)key; (void)ud;
+    struct alloc_node* an = (struct alloc_node*)value;
+    if (an) {
+        pfree(an);
+    }
+}
+
+static void
 profile_free(struct profile_context* context) {
     if (context->callpath) {
         icallpath_free(context->callpath);
@@ -187,6 +194,8 @@ profile_free(struct profile_context* context) {
     imap_free(context->cs_map);
     imap_dump(context->symbol_map, _ob_free_symbol, NULL);
     imap_free(context->symbol_map);
+    imap_dump(context->alloc_map, _ob_free_alloc_node, NULL);
+    imap_free(context->alloc_map);
     pfree(context);
 }
 
@@ -524,8 +533,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
             uint64_t total_cost = cur_time - cur_frame->call_time;
             uint64_t real_cost = total_cost - cur_frame->co_cost;
             assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
-            cur_frame->ret_time = cur_time;
-            cur_frame->real_cost = real_cost;
             cur_path->last_ret_time = cur_time;
             cur_path->real_cost += real_cost;
 
