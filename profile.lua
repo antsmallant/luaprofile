@@ -22,14 +22,17 @@ local function my_coroutine_wrap(f)
 end
 
 local g_profile_started = false
+local g_opts = nil
 
-function M.start()
+-- opts = { cpu = "off|profile|sample", mem = "off|profile|sample", sample_period = 10000 }
+function M.start(opts)
     if g_profile_started then
         print("profile start fail, already started")
         return
     end
     g_profile_started = true
-    c.start()
+    g_opts = opts or { cpu = "profile", mem = "profile", sample_period = 10000 }
+    c.start(g_opts)
     coroutine.create = my_coroutine_create
     coroutine.wrap = my_coroutine_wrap
 end
@@ -44,6 +47,7 @@ function M.stop()
     local record_time, nodes = c.dump()
     c.stop()
     g_profile_started = false
+    g_opts = nil
     return {time = record_time, nodes = nodes}
 end
 

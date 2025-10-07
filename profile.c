@@ -2,10 +2,12 @@
 
 #include "profile.h"
 #include "imap.h"
+#include "smap.h"
 #include "icallpath.h"
 #include "lobject.h"
 #include "lstate.h"
 #include "lua.h"
+#include "lauxlib.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
@@ -27,6 +29,14 @@ node1
 #define MAX_CO_SIZE                 1024
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
+#define MAX_SAMPLE_DEPTH            64
+
+// 模式定义（统一用于 CPU/Memory）
+#define MODE_OFF                    0
+#define MODE_PROFILE                1
+#define MODE_SAMPLE                 2
+
+#define DEFAULT_SAMPLE_PERIOD       10000
 
 static char profile_context_key = 'x';
 
@@ -47,6 +57,60 @@ realtime_sec(uint64_t t) {
 static inline double
 realtime_ms(uint64_t t) {
     return (double)t / NANOSEC * MICROSEC;
+}
+
+// forward decl
+static inline char* pstrdup(const char* s);
+
+// 64-bit FNV-1a hash for strings
+static inline uint64_t
+hash64_str(const char* s) {
+    const uint64_t FNV_OFFSET = 1469598103934665603ULL;
+    const uint64_t FNV_PRIME  = 1099511628211ULL;
+    uint64_t h = FNV_OFFSET;
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        h ^= (uint64_t)(*p);
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+// 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample", sample_period = int }
+static bool
+read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_sample_period) {
+    if (!out_cpu_mode || !out_mem_mode || !out_sample_period) return false;
+    *out_cpu_mode = MODE_PROFILE;
+    *out_mem_mode = MODE_PROFILE;
+    *out_sample_period = DEFAULT_SAMPLE_PERIOD;
+    if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
+
+    lua_getfield(L, 1, "cpu");
+    if (lua_isstring(L, -1)) {
+        const char* s = lua_tostring(L, -1);
+        if (strcmp(s, "off") == 0) *out_cpu_mode = MODE_OFF;
+        else if (strcmp(s, "profile") == 0) *out_cpu_mode = MODE_PROFILE;
+        else if (strcmp(s, "sample") == 0) *out_cpu_mode = MODE_SAMPLE;
+        else {printf("invalid cpu mode: %s\n", s); return false;}
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "mem");
+    if (lua_isstring(L, -1)) {
+        const char* s = lua_tostring(L, -1);
+        if (strcmp(s, "off") == 0) *out_mem_mode = MODE_OFF;
+        else if (strcmp(s, "profile") == 0) *out_mem_mode = MODE_PROFILE;
+        else if (strcmp(s, "sample") == 0) *out_mem_mode = MODE_SAMPLE;
+        else {printf("invalid mem mode: %s\n", s); return false;}
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "sample_period");
+    if (lua_isinteger(L, -1)) {
+        int sp = (int)lua_tointeger(L, -1);
+        if (sp > 0) *out_sample_period = sp;
+    }
+    lua_pop(L, 1);
+    return true;
 }
 
 struct call_frame {
@@ -73,8 +137,12 @@ struct profile_context {
     struct imap_context*        cs_map;
     struct imap_context*        alloc_map;
     struct imap_context*        symbol_map;
+    smap_t*                     sample_map;   // folded stacks for cpu sampling
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
+    int         cpu_mode;       // MODE_*
+    int         mem_mode;       // MODE_*
+    int         sample_period;  // instruction count for LUA_MASKCOUNT
 };
 
 struct callpath_node {
@@ -86,6 +154,7 @@ struct callpath_node {
     uint64_t last_ret_time;
     uint64_t call_count;
     uint64_t real_cost;
+    uint64_t cpu_samples;    // sampling count (leaf samples), aggregated at dump
     uint64_t alloc_bytes;
     uint64_t free_bytes;
     uint64_t alloc_times;
@@ -104,6 +173,9 @@ struct symbol_info {
     int line;
 };
 
+// 简单的字符串 HashMap（链式散列），用于 CPU 抽样折叠栈
+// use external smap
+
 static struct callpath_node*
 callpath_node_create() {
     struct callpath_node* node = (struct callpath_node*)pmalloc(sizeof(*node));
@@ -115,6 +187,7 @@ callpath_node_create() {
     node->last_ret_time = 0;
     node->call_count = 0;
     node->real_cost = 0;
+    node->cpu_samples = 0;
     node->alloc_bytes = 0;
     node->free_bytes = 0;
     node->alloc_times = 0;
@@ -141,6 +214,62 @@ pstrdup(const char* s) {
     return d;
 }
 
+// free counters stored as smap values (uint64_t*)
+static void _free_counter_cb(const char* key, void* value, void* ud) {
+    (void)key; (void)ud;
+    if (value) pfree(value);
+}
+
+struct smap_dump_ctx {
+    lua_State* L;
+    size_t idx;
+};
+
+struct fg_dump_ctx {
+    luaL_Buffer* buf;
+    struct imap_context* symbol_map;
+};
+
+static void _fg_dump_cb(const char* key, void* value, void* ud) {
+    struct fg_dump_ctx* ctx = (struct fg_dump_ctx*)ud;
+    luaL_Buffer* b = ctx->buf;
+    uint64_t samples = value ? *(uint64_t*)value : 0;
+    if (samples == 0) return;
+    const char* p = key;
+    char token[64];
+    size_t tlen = 0;
+    int first = 1;
+    while (1) {
+        char c = *p++;
+        if (c == ';' || c == '\0') {
+            token[tlen] = '\0';
+            void* fptr = NULL;
+            sscanf(token, "%p", &fptr);
+            uint64_t sym_key = (uint64_t)((uintptr_t)fptr);
+            struct symbol_info* si = (struct symbol_info*)imap_query(ctx->symbol_map, sym_key);
+            if (!first) luaL_addchar(b, ';');
+            if (si) {
+                char namebuf[512];
+                const char* nm = (si->name && si->name[0]) ? si->name : "anonymous";
+                const char* src = (si->source && si->source[0]) ? si->source : "(source)";
+                int ln = si->line;
+                int n = snprintf(namebuf, sizeof(namebuf)-1, "%s %s:%d", nm, src, ln);
+                if (n > 0) luaL_addlstring(b, namebuf, (size_t)n);
+            } else {
+                luaL_addlstring(b, token, tlen);
+            }
+            tlen = 0;
+            first = 0;
+            if (c == '\0') break;
+        } else {
+            if (tlen + 1 < sizeof(token)) token[tlen++] = c;
+        }
+    }
+    char tail[64];
+    int m = snprintf(tail, sizeof(tail)-1, " %llu\n", (unsigned long long)samples);
+    if (m > 0) luaL_addlstring(b, tail, (size_t)m);
+}
+
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -150,11 +279,15 @@ profile_create() {
     context->cs_map = imap_create();
     context->alloc_map = imap_create();
     context->symbol_map = imap_create();
+    context->sample_map = smap_create(2048);
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->running_in_hook = false;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
+    context->cpu_mode = MODE_PROFILE;       // default: profile
+    context->mem_mode = MODE_PROFILE;       // default: profile
+    context->sample_period = DEFAULT_SAMPLE_PERIOD; // default instruction period for sampling
     return context;
 }
 
@@ -194,6 +327,11 @@ profile_free(struct profile_context* context) {
     imap_free(context->cs_map);
     imap_dump(context->symbol_map, _ob_free_symbol, NULL);
     imap_free(context->symbol_map);
+    if (context->sample_map) {
+        // free smap entries' values (uint64_t*)
+        smap_iterate(context->sample_map, _free_counter_cb, NULL);
+        smap_free(context->sample_map);
+    }
     imap_dump(context->alloc_map, _ob_free_alloc_node, NULL);
     imap_free(context->alloc_map);
     pfree(context);
@@ -382,6 +520,40 @@ static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
     return proto;
 }
 
+// Ensure symbol_map has an entry for the given prototype
+static inline void _ensure_symbol(struct profile_context* context, lua_State* L, lua_Debug* ar, const void* proto) {
+    uint64_t sym_key = (uint64_t)((uintptr_t)proto);
+    if (imap_query(context->symbol_map, sym_key) != NULL) return;
+
+    const char* name = ar->name;
+    int line = ar->linedefined;
+    const char* source = ar->source;
+    char flag = ar->what[0];
+
+    struct symbol_info* si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+    if (flag == 'C') {
+        // C 帧：不要绑定到 Lua 行号；优先使用 name，缺失则用指针占位
+        char buf[64];
+        const char* nm = name;
+        if (!nm) {
+            snprintf(buf, sizeof(buf)-1, "cfunc@%p", proto);
+            nm = buf;
+        }
+        si->name = pstrdup(nm);
+        si->source = pstrdup("=[C]");
+        si->line = 0;
+    } else {
+        const char* nm = name;
+        if (!nm) {
+            nm = (line == 0) ? "chunk" : "anonymous";
+        }
+        si->name = pstrdup(nm);
+        si->source = pstrdup(source ? source : "");
+        si->line = line;
+    }
+    imap_set(context->symbol_map, sym_key, si);
+}
+
 // hook alloc/free/realloc 事件
 static void*
 _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {   
@@ -476,6 +648,50 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
     uint64_t cur_time = gettime();
     int event = far->event;
+
+    // COUNT 事件优先处理：采样只抓栈
+    if (event == LUA_HOOKCOUNT) {
+        // 抓栈 → 生成折叠 key（prototype 地址串）→ 在 sample_map 中累加计数
+        void* frames[MAX_SAMPLE_DEPTH];
+        int depth = 0;
+        lua_Debug ar;
+        while (depth < MAX_SAMPLE_DEPTH && lua_getstack(L, depth, &ar)) {
+            lua_getinfo(L, "nSl", &ar);
+            const void* proto = _get_prototype(L, &ar);
+            _ensure_symbol(context, L, &ar, proto);
+            frames[depth] = (void*)proto;
+            depth++;
+        }
+        if (depth > 0) {
+            // 估算 key 长度：每帧 2+16 字符 + 分隔符（root->leaf 顺序）
+            size_t bufcap = (size_t)depth * 20 + 1;
+            char* buf = (char*)pmalloc(bufcap);
+            size_t off = 0;
+            for (int i = depth - 1; i >= 0; i--) {
+                int n = snprintf(buf + off, bufcap - off, "%p%s", frames[i], (i == 0 ? "" : ";"));
+                if (n < 0) { off = 0; break; }
+                off += (size_t)n;
+                if (off >= bufcap) { off = bufcap - 1; break; }
+            }
+            if (off > 0) {
+                void* pv = smap_get(context->sample_map, buf);
+                uint64_t* counter = (uint64_t*)pv;
+                if (!counter) {
+                    counter = (uint64_t*)pmalloc(sizeof(uint64_t));
+                    *counter = 0;
+                    smap_set(context->sample_map, buf, counter);
+                }
+                *counter += 1;
+            }
+            pfree(buf);
+        }
+        if (context->cpu_mode == MODE_SAMPLE) {
+            lua_sethook(L, _hook_call, LUA_MASKCOUNT, context->sample_period);
+        }
+        context->running_in_hook = false;
+        return;
+    }
+
     struct call_state* cs = context->cur_cs;
     if (!context->cur_cs || context->cur_cs->co != L) {
         uint64_t key = (uint64_t)((uintptr_t)L);
@@ -522,8 +738,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
 
     } else if (event == LUA_HOOKRET) {
-        int len = cs->top;
-        if (len <= 0) {
+        if (cs->top <= 0) {
             context->running_in_hook = false;
             return;
         }
@@ -550,6 +765,7 @@ struct dump_call_path_arg {
     lua_State* L;
     uint64_t real_cost;
     uint64_t index;
+    uint64_t cpu_samples_sum;
     uint64_t alloc_bytes_sum;
     uint64_t free_bytes_sum;
     uint64_t alloc_times_sum;
@@ -561,6 +777,7 @@ static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, lua_State* 
     arg->L = L;
     arg->real_cost = 0;
     arg->index = 0;
+    arg->cpu_samples_sum = 0;
     arg->alloc_bytes_sum = 0;
     arg->free_bytes_sum = 0;
     arg->alloc_times_sum = 0;
@@ -598,12 +815,14 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t free_times_incl = node->free_times + child_arg.free_times_sum;
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
     uint64_t real_cost = node->real_cost + child_arg.real_cost;
+    uint64_t cpu_samples_incl = node->cpu_samples + child_arg.cpu_samples_sum;
     // 本节点的其他指标
     uint64_t call_count = node->call_count;
     uint64_t inuse_bytes = alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999;
 
     // 累加到父节点
     arg->real_cost += real_cost;
+    arg->cpu_samples_sum += cpu_samples_incl;
     arg->alloc_bytes_sum += alloc_bytes_incl;
     arg->free_bytes_sum += free_bytes_incl;
     arg->alloc_times_sum += alloc_times_incl;
@@ -624,6 +843,9 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     lua_pushinteger(arg->L, node->last_ret_time);
     lua_setfield(arg->L, -2, "last_ret_time");
+
+    lua_pushinteger(arg->L, (lua_Integer)cpu_samples_incl);
+    lua_setfield(arg->L, -2, "cpu_samples");
 
     lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
     lua_setfield(arg->L, -2, "alloc_bytes");
@@ -673,8 +895,18 @@ _hook_all_co(lua_State* L) {
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
+    struct profile_context* ctx = get_profile_context(L);
     for (i = i - 1; i >= 0; i--) {
-        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
+        if (ctx && ctx->cpu_mode == MODE_SAMPLE) {
+            // sampling: instruction-count based
+            lua_sethook(states[i], _hook_call, LUA_MASKCOUNT, ctx->sample_period);
+        } else if (ctx && ctx->cpu_mode == MODE_PROFILE) {
+            // profiling (full call/ret)
+            lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
+        } else {
+            // off
+            lua_sethook(states[i], NULL, 0, 0);
+        }
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
 }
@@ -701,18 +933,33 @@ _lstart(lua_State* L) {
         return 0;
     }
 
-    lua_gc(L, LUA_GCCOLLECT, 0);  // full gc  
+    // parse options: start([opts]), opts is a table
+    int cpu_mode = MODE_PROFILE; // default profile
+    int mem_mode = MODE_PROFILE; // default profile
+    int sample_period = DEFAULT_SAMPLE_PERIOD;
+    bool read_ok = read_arg(L, &cpu_mode, &mem_mode, &sample_period);
+    if (!read_ok) {
+        printf("start fail, invalid options\n");
+        return 0;
+    }
+
+    lua_gc(L, LUA_GCCOLLECT, 0);  // full gc
 
     context = profile_create();
     context->running_in_hook = true;
     context->start_time = gettime();
     context->is_ready = true;
+    context->cpu_mode = cpu_mode;
+    context->mem_mode = mem_mode;
+    context->sample_period = sample_period;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    lua_setallocf(L, _hook_alloc, context);
+    if (mem_mode != MODE_OFF) {
+        lua_setallocf(L, _hook_alloc, context);
+    }
     set_profile_context(L, context);
     _hook_all_co(L);
     context->running_in_hook = false;
-    printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);    
+    printf("luaprofile started, cpu_mode = %d, mem_mode = %d, sample_period = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->sample_period, context->last_alloc_ud);    
     return 0;
 }
 
@@ -771,7 +1018,7 @@ _lunmark(lua_State* L) {
 static int
 _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
-    if (context && context->callpath) {
+    if (context) {
         // full gc
         lua_gc(L, LUA_GCCOLLECT, 0);
 
@@ -780,11 +1027,26 @@ _ldump(lua_State* L) {
         if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
         context->running_in_hook = true;
         uint64_t cur_time = gettime();
-        struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
-        root->last_ret_time = cur_time;            
         uint64_t profile_time = cur_time - context->start_time;
         lua_pushinteger(L, profile_time);
-        dump_call_path(L, context->callpath);
+
+        if (context->cpu_mode == MODE_SAMPLE) {
+            // dump folded stacks in FlameGraph format (lines of: path1;path2 count)
+            luaL_Buffer b;
+            luaL_buffinit(L, &b);
+            struct fg_dump_ctx fctx = { .buf = &b, .symbol_map = context->symbol_map };
+            smap_iterate(context->sample_map, _fg_dump_cb, &fctx);
+            luaL_pushresult(&b);
+        } else {
+            // tracing dump
+            if (context->callpath) {
+                struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
+                root->last_ret_time = cur_time;
+                dump_call_path(L, context->callpath);
+            } else {
+                lua_newtable(L);
+            }
+        }
         context->running_in_hook = false;
         if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
         return 2;

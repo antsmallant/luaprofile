@@ -9,3 +9,6 @@ test.lua
 build/
 .cache/
 compile_commands.json
+design/
+cpu-samples.txt
+cpu-samples.svg

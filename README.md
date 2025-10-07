@@ -16,4 +16,26 @@ build.sh
 ./build/lua-5.4.8/install/bin/lua example.lua
 ```
 
+# read result
+
+## json
 view json in a better way using https://jsonstudio.io/view/json-grid-viewer or https://jsongrid.com/json-grid .
+
+## flame 
+
+1. pprof tools
+
+install: 
+```
+sudo apt update && sudo apt install -y git perl
+git clone https://github.com/brendangregg/FlameGraph.git ~/FlameGraph
+chmod +x ~/FlameGraph/flamegraph.pl
+```
+
+generate svg:
+```
+~/FlameGraph/flamegraph.pl /tmp/folded.txt > /tmp/flame.svg && xdg-open /tmp/flame.svg
+```
+
+2. website
+
