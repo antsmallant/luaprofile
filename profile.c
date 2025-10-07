@@ -29,7 +29,7 @@ node1
 #define MAX_CO_SIZE                 1024
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
-#define MAX_SAMPLE_DEPTH            64
+#define MAX_SAMPLE_DEPTH            256
 
 // 模式定义（统一用于 CPU/Memory）
 #define MODE_OFF                    0
