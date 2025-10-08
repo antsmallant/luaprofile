@@ -64,7 +64,9 @@ local function test1()
     profile.start(opts)
     test_storage1()
     test_storage2()
-    tonumber("123")    
+    for i = 1, 3000 do
+        tonumber("123")    
+    end
     print("111")
     tonumber("234")
     print("222")
