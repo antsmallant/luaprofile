@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 /*
 callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
@@ -57,22 +58,6 @@ realtime_sec(uint64_t t) {
 static inline double
 realtime_ms(uint64_t t) {
     return (double)t / NANOSEC * MICROSEC;
-}
-
-// forward decl
-static inline char* pstrdup(const char* s);
-
-// 64-bit FNV-1a hash for strings
-static inline uint64_t
-hash64_str(const char* s) {
-    const uint64_t FNV_OFFSET = 1469598103934665603ULL;
-    const uint64_t FNV_PRIME  = 1099511628211ULL;
-    uint64_t h = FNV_OFFSET;
-    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
-        h ^= (uint64_t)(*p);
-        h *= FNV_PRIME;
-    }
-    return h;
 }
 
 // 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample", sample_period = int }
@@ -143,6 +128,7 @@ struct profile_context {
     int         cpu_mode;       // MODE_*
     int         mem_mode;       // MODE_*
     int         sample_period;  // instruction count for LUA_MASKCOUNT
+    uint64_t    rng_state;      // RNG state for sampling gaps
 };
 
 struct callpath_node {
@@ -288,6 +274,7 @@ profile_create() {
     context->cpu_mode = MODE_PROFILE;       // default: profile
     context->mem_mode = MODE_PROFILE;       // default: profile
     context->sample_period = DEFAULT_SAMPLE_PERIOD; // default instruction period for sampling
+    context->rng_state = 0;
     return context;
 }
 
@@ -383,6 +370,27 @@ static void unset_profile_context(lua_State* L) {
     lua_pushlightuserdata(L, &profile_context_key);
     lua_pushnil(L);
     lua_rawset(L, LUA_REGISTRYINDEX);
+}
+
+// --- Random gap generator (exponential/geometric) ---
+static inline uint64_t xorshift64(uint64_t* s) {
+    uint64_t x = (*s) ? *s : 88172645463393265ULL;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *s = x;
+    return x;
+}
+
+static inline int next_exponential_gap(struct profile_context* ctx) {
+    // mean = ctx->sample_period (instructions)
+    // u in (0,1], avoid 0
+    uint64_t r = xorshift64(&ctx->rng_state);
+    double u = ( (r >> 11) * (1.0 / 9007199254740992.0) ); // 53-bit to [0,1)
+    if (u <= 0.0) u = 1e-12;
+    int gap = (int)floor(-log(u) * (double)ctx->sample_period);
+    if (gap < 1) gap = 1;
+    return gap;
 }
 
 static struct icallpath_context*
@@ -686,7 +694,9 @@ _hook_call(lua_State* L, lua_Debug* far) {
             pfree(buf);
         }
         if (context->cpu_mode == MODE_SAMPLE) {
-            lua_sethook(L, _hook_call, LUA_MASKCOUNT, context->sample_period);
+            int gap = next_exponential_gap(context);
+            printf("set hook with gap %d\n", gap);
+            lua_sethook(L, _hook_call, LUA_MASKCOUNT, gap);
         }
         context->running_in_hook = false;
         return;
@@ -898,8 +908,10 @@ _hook_all_co(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     for (i = i - 1; i >= 0; i--) {
         if (ctx && ctx->cpu_mode == MODE_SAMPLE) {
-            // sampling: instruction-count based
-            lua_sethook(states[i], _hook_call, LUA_MASKCOUNT, ctx->sample_period);
+            // sampling: instruction-count based with exponential gaps
+            int gap = next_exponential_gap(ctx);
+            printf("set hook with gap %d\n", gap);
+            lua_sethook(states[i], _hook_call, LUA_MASKCOUNT, gap);
         } else if (ctx && ctx->cpu_mode == MODE_PROFILE) {
             // profiling (full call/ret)
             lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
@@ -952,6 +964,8 @@ _lstart(lua_State* L) {
     context->cpu_mode = cpu_mode;
     context->mem_mode = mem_mode;
     context->sample_period = sample_period;
+    // seed rng with time xor state pointer
+    context->rng_state = gettime() ^ (uint64_t)(uintptr_t)context;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     if (mem_mode != MODE_OFF) {
         lua_setallocf(L, _hook_alloc, context);
