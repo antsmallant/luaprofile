@@ -1068,6 +1068,11 @@ _ldump(lua_State* L) {
     return 0;
 }
 
+static int _lgetnanoseconds(lua_State* L) {
+    lua_pushinteger(L, gettime());
+    return 1;
+}
+
 int
 luaopen_luaprofilec(lua_State* L) {
     luaL_checkversion(L);
@@ -1077,6 +1082,7 @@ luaopen_luaprofilec(lua_State* L) {
         {"mark", _lmark},
         {"unmark", _lunmark},
         {"dump", _ldump},
+        {"getnanoseconds", _lgetnanoseconds},
         {NULL, NULL},
     };
     luaL_newlib(L, l);
