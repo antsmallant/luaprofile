@@ -832,7 +832,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t cpu_samples_incl = node->cpu_samples + child_arg.cpu_samples_sum;
     // 本节点的其他指标
     uint64_t call_count = node->call_count;
-    uint64_t inuse_bytes = alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999;
+    uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
     arg->real_cost += real_cost;
