@@ -41,10 +41,24 @@ node1
 
 static char profile_context_key = 'x';
 
+// 获取单调递增的时间戳（纳秒），不会被 NTP 调整。
+// 只用于计算时间差，不能当成绝对时间戳用于获取当前的年月日。
+// 如果需要获取绝对时间戳，请使用 get_realtime_ns。    
 static inline uint64_t
 get_mono_ns() {
     struct timespec ti;
     clock_gettime(CLOCK_MONOTONIC, &ti);
+    uint64_t sec = (uint64_t)ti.tv_sec;
+    uint64_t nsec = (uint64_t)ti.tv_nsec;
+    return sec * (uint64_t)NANOSEC + nsec;
+}
+
+// 获取绝对时间戳（纳秒），会受 NTP 调整。
+// 可以用于获取当前的年月日。
+static inline uint64_t
+get_realtime_ns() {
+    struct timespec ti;
+    clock_gettime(CLOCK_REALTIME, &ti);
     uint64_t sec = (uint64_t)ti.tv_sec;
     uint64_t nsec = (uint64_t)ti.tv_nsec;
     return sec * (uint64_t)NANOSEC + nsec;
