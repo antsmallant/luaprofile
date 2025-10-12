@@ -13,22 +13,22 @@ local function test1()
 end
 
 local function test_non_profile()
-    local t1 = c.getnanoseconds()
+    local t1 = c.getmonons()
     for i = 1, 10 do
         test1()
     end
-    local t2 = c.getnanoseconds()
+    local t2 = c.getmonons()
     print("test_non_profile cost:", t2 - t1)
 end
 
 local function test_profile()
     local opts = { cpu = "profile", mem = "off", sample_period = 10 }
     profile.start(opts)
-    local t1 = c.getnanoseconds()
+    local t1 = c.getmonons()
     for i = 1, 10 do
         test1()
     end
-    local t2 = c.getnanoseconds()
+    local t2 = c.getmonons()
     print("test_profile cost:", t2 - t1)
     profile.stop()
 end

@@ -60,7 +60,7 @@ local function write_file(path, content)
 end
 
 local function test1()
-    local opts = { cpu = "sample", mem = "sample", sample_period = 10 }
+    local opts = { cpu = "sample", mem = "sample", sample_period = 1 }
     profile.start(opts)
     test_storage1()
     test_storage2()

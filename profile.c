@@ -42,22 +42,12 @@ node1
 static char profile_context_key = 'x';
 
 static inline uint64_t
-gettime() {
+get_mono_ns() {
     struct timespec ti;
-    clock_gettime(CLOCK_REALTIME, &ti);  // would be faster
-    long sec = ti.tv_sec & 0xffff;
-    long nsec = ti.tv_nsec;
-    return sec * NANOSEC + nsec;
-}
-
-static inline double
-realtime_sec(uint64_t t) {
-    return (double)t / NANOSEC;
-}
-
-static inline double
-realtime_ms(uint64_t t) {
-    return (double)t / NANOSEC * MICROSEC;
+    clock_gettime(CLOCK_MONOTONIC, &ti);
+    uint64_t sec = (uint64_t)ti.tv_sec;
+    uint64_t nsec = (uint64_t)ti.tv_nsec;
+    return sec * (uint64_t)NANOSEC + nsec;
 }
 
 // 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample", sample_period = int }
@@ -654,7 +644,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
     context->running_in_hook = true;
 
-    uint64_t cur_time = gettime();
+    uint64_t cur_time = get_mono_ns();
     int event = far->event;
 
     // COUNT 事件优先处理：采样只抓栈
@@ -959,13 +949,13 @@ _lstart(lua_State* L) {
 
     context = profile_create();
     context->running_in_hook = true;
-    context->start_time = gettime();
+    context->start_time = get_mono_ns();
     context->is_ready = true;
     context->cpu_mode = cpu_mode;
     context->mem_mode = mem_mode;
     context->sample_period = sample_period;
     // seed rng with time xor state pointer
-    context->rng_state = gettime() ^ (uint64_t)(uintptr_t)context;
+    context->rng_state = get_mono_ns() ^ (uint64_t)(uintptr_t)context;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     if (mem_mode != MODE_OFF) {
         lua_setallocf(L, _hook_alloc, context);
@@ -1040,7 +1030,7 @@ _ldump(lua_State* L) {
         int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
         if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
         context->running_in_hook = true;
-        uint64_t cur_time = gettime();
+        uint64_t cur_time = get_mono_ns();
         uint64_t profile_time = cur_time - context->start_time;
         lua_pushinteger(L, profile_time);
 
@@ -1068,8 +1058,8 @@ _ldump(lua_State* L) {
     return 0;
 }
 
-static int _lgetnanoseconds(lua_State* L) {
-    lua_pushinteger(L, gettime());
+static int _lgetmonons(lua_State* L) {
+    lua_pushinteger(L, get_mono_ns());
     return 1;
 }
 
@@ -1082,7 +1072,7 @@ luaopen_luaprofilec(lua_State* L) {
         {"mark", _lmark},
         {"unmark", _lunmark},
         {"dump", _ldump},
-        {"getnanoseconds", _lgetnanoseconds},
+        {"getmonons", _lgetmonons},
         {NULL, NULL},
     };
     luaL_newlib(L, l);
