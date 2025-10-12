@@ -22,7 +22,7 @@ local function test_non_profile()
 end
 
 local function test_profile()
-    local opts = { cpu = "profile", mem = "off", sample_period = 10 }
+    local opts = { cpu = "profile", mem = "profile", sample_period = 10 }
     profile.start(opts)
     local t1 = c.getmonons()
     for i = 1, 10 do

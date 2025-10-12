@@ -904,12 +904,19 @@ get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
 
 static void
 _hook_all_co(lua_State* L) {
+    struct profile_context* ctx = get_profile_context(L);
+    if (!ctx) {
+        printf("hook all co fail, profile not started\n");
+        return;
+    }
+    if (ctx->cpu_mode == MODE_OFF) {
+        return;
+    }
     // stop gc before set hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
-    struct profile_context* ctx = get_profile_context(L);
     for (i = i - 1; i >= 0; i--) {
         if (ctx && ctx->cpu_mode == MODE_SAMPLE) {
             // sampling: instruction-count based with exponential gaps
@@ -919,9 +926,6 @@ _hook_all_co(lua_State* L) {
         } else if (ctx && ctx->cpu_mode == MODE_PROFILE) {
             // profiling (full call/ret)
             lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
-        } else {
-            // off
-            lua_sethook(states[i], NULL, 0, 0);
         }
     }
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
@@ -929,6 +933,14 @@ _hook_all_co(lua_State* L) {
 
 static void 
 _unhook_all_co(lua_State* L) {
+    struct profile_context* ctx = get_profile_context(L);
+    if (!ctx) {
+        printf("unhook all co fail, profile not started\n");
+        return;
+    }
+    if (ctx->cpu_mode == MODE_OFF) {
+        return;
+    }    
     // stop gc before unset hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }     

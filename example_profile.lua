@@ -4,6 +4,7 @@ package.cpath = package.cpath .. ";" .. root .. "?.so"
 
 local profile = require "profile"
 local json = require "json"
+local c = require "luaprofilec"
 
 local g_storage = {}
 
@@ -48,8 +49,7 @@ local function test_storage2()
     end
 end
 
-local function test1()
-    profile.start()
+local function do_test()
     test_storage1()
     test_storage2()
     tonumber("123")    
@@ -57,14 +57,30 @@ local function test1()
     tonumber("234")
     print("222")
     test2()
-    test_vccl()
+    test_vccl()    
+end
+
+local function test_with_profile()
+    local opts = { cpu = "profile", mem = "profile", sample_period = 10 }
+    profile.start(opts)
+    local t1 = c.getmonons()
+    do_test()
+    local t2 = c.getmonons()
     local result = profile.stop()
     local strResult = json.encode(result)
     print(strResult)
+    return t2 - t1
 end
 
-local function test()
-    test1()
+local function test_without_profile()
+    local t1 = c.getmonons()
+    do_test()
+    local t2 = c.getmonons()
+    return t2 - t1
 end
 
-test()
+local cost_without_profile = test_without_profile()
+local cost_with_profile = test_with_profile()
+print("test_with_profile cost:", cost_with_profile)
+print("test_without_profile cost:", cost_without_profile)
+print("test_with_profile cost / test_without_profile cost:", cost_with_profile / cost_without_profile)
