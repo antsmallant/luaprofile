@@ -61,7 +61,7 @@ local function do_test()
 end
 
 local function test_with_profile()
-    local opts = { cpu = "profile", mem = "profile", sample_period = 10 }
+    local opts = { cpu = "profile", mem = "off", sample_period = 1 }
     profile.start(opts)
     local t1 = c.getmonons()
     do_test()

@@ -776,9 +776,10 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
 
 struct dump_call_path_arg {
+    struct profile_context* pcontext;
     lua_State* L;
-    uint64_t real_cost;
     uint64_t index;
+    uint64_t real_cost_sum;
     uint64_t cpu_samples_sum;
     uint64_t alloc_bytes_sum;
     uint64_t free_bytes_sum;
@@ -787,10 +788,11 @@ struct dump_call_path_arg {
     uint64_t realloc_times_sum;
 };
 
-static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, lua_State* L) {
+static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct profile_context* pcontext, lua_State* L) {
+    arg->pcontext = pcontext;
     arg->L = L;
-    arg->real_cost = 0;
     arg->index = 0;
+    arg->real_cost_sum = 0;
     arg->cpu_samples_sum = 0;
     arg->alloc_bytes_sum = 0;
     arg->free_bytes_sum = 0;
@@ -813,7 +815,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     // 递归获取所有子结点的指标和
     struct dump_call_path_arg child_arg;
-    _init_dump_call_path_arg(&child_arg, arg->L);
+    _init_dump_call_path_arg(&child_arg, arg->pcontext, arg->L);
     if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
         icallpath_dump_children(path, _dump_call_path_child, &child_arg);
@@ -822,20 +824,25 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
 
+    if (node->parent == NULL) {
+        arg->real_cost_sum = node->real_cost;
+        node->real_cost = arg->real_cost_sum;
+    }
+
     // 本节点的聚合指标=本节点指标+所有子结点的指标
     uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
     uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
     uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
     uint64_t free_times_incl = node->free_times + child_arg.free_times_sum;
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
-    uint64_t real_cost = node->real_cost + child_arg.real_cost;
     uint64_t cpu_samples_incl = node->cpu_samples + child_arg.cpu_samples_sum;
     // 本节点的其他指标
+    uint64_t real_cost = node->real_cost;
     uint64_t call_count = node->call_count;
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
-    arg->real_cost += real_cost;
+    arg->real_cost_sum += node->real_cost;
     arg->cpu_samples_sum += cpu_samples_incl;
     arg->alloc_bytes_sum += alloc_bytes_incl;
     arg->free_bytes_sum += free_bytes_incl;
@@ -849,40 +856,55 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushstring(arg->L, name);
     lua_setfield(arg->L, -2, "name");
 
-    lua_pushinteger(arg->L, call_count);
-    lua_setfield(arg->L, -2, "call_count");
-
-    lua_pushinteger(arg->L, real_cost);
-    lua_setfield(arg->L, -2, "cpu_cost_ns");
-
     lua_pushinteger(arg->L, node->last_ret_time);
     lua_setfield(arg->L, -2, "last_ret_time");
 
-    lua_pushinteger(arg->L, (lua_Integer)cpu_samples_incl);
-    lua_setfield(arg->L, -2, "cpu_samples");
+    if (arg->pcontext->cpu_mode == MODE_PROFILE) {
+        lua_pushinteger(arg->L, call_count);
+        lua_setfield(arg->L, -2, "call_count");
 
-    lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
-    lua_setfield(arg->L, -2, "alloc_bytes");
+        lua_pushinteger(arg->L, real_cost);
+        lua_setfield(arg->L, -2, "cpu_cost_ns");
 
-    lua_pushinteger(arg->L, (lua_Integer)free_bytes_incl);
-    lua_setfield(arg->L, -2, "free_bytes");
+        uint64_t parent_real_cost = 0;
+        if (node->parent) {
+            parent_real_cost = node->parent->real_cost;
+        }
+        double percent = parent_real_cost > 0 ? ((double)real_cost / parent_real_cost * 100.0) : 100;
+        char percent_str[32] = {0};
+        snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
+        lua_pushstring(arg->L, percent_str);
+        lua_setfield(arg->L, -2, "cpu_cost_percent");
 
-    lua_pushinteger(arg->L, (lua_Integer)alloc_times_incl);
-    lua_setfield(arg->L, -2, "alloc_times");
+    } else if (arg->pcontext->cpu_mode == MODE_SAMPLE) {
+        lua_pushinteger(arg->L, (lua_Integer)cpu_samples_incl);
+        lua_setfield(arg->L, -2, "cpu_samples");
+    }
 
-    lua_pushinteger(arg->L, (lua_Integer)free_times_incl);
-    lua_setfield(arg->L, -2, "free_times");
+    if (arg->pcontext->mem_mode == MODE_PROFILE) {
+        lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
+        lua_setfield(arg->L, -2, "alloc_bytes");
 
-    lua_pushinteger(arg->L, (lua_Integer)realloc_times_incl);
-    lua_setfield(arg->L, -2, "realloc_times");
+        lua_pushinteger(arg->L, (lua_Integer)free_bytes_incl);
+        lua_setfield(arg->L, -2, "free_bytes");
 
-    lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
-    lua_setfield(arg->L, -2, "inuse_bytes");
+        lua_pushinteger(arg->L, (lua_Integer)alloc_times_incl);
+        lua_setfield(arg->L, -2, "alloc_times");
+
+        lua_pushinteger(arg->L, (lua_Integer)free_times_incl);
+        lua_setfield(arg->L, -2, "free_times");
+
+        lua_pushinteger(arg->L, (lua_Integer)realloc_times_incl);
+        lua_setfield(arg->L, -2, "realloc_times");
+
+        lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
+        lua_setfield(arg->L, -2, "inuse_bytes");
+    }
 }
 
-static void dump_call_path(lua_State* L, struct icallpath_context* path) {
+static void dump_call_path(struct profile_context* context, lua_State* L, struct icallpath_context* path) {
     struct dump_call_path_arg arg;
-    _init_dump_call_path_arg(&arg, L);
+    _init_dump_call_path_arg(&arg, context, L);
     _dump_call_path(path, &arg);
 }
 
@@ -1072,7 +1094,7 @@ _ldump(lua_State* L) {
             if (context->callpath) {
                 struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
                 root->last_ret_time = cur_time;
-                dump_call_path(L, context->callpath);
+                dump_call_path(context, L, context->callpath);
             } else {
                 lua_newtable(L);
             }
