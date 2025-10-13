@@ -901,13 +901,11 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 }
 
-
 static void sum_root_stat(uint64_t key, void* value, void* ud) {
     struct sum_root_stat_arg* arg = (struct sum_root_stat_arg*)ud;
     struct icallpath_context* path = (struct icallpath_context*)value;
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
     arg->real_cost_sum += node->real_cost;
-    printf("sum_root_stat: %s real_cost_sum: %lu, real_cost: %lu\n", node->name, arg->real_cost_sum, node->real_cost);
 }
 
 static void update_root_stat(struct profile_context* pcontext, lua_State* L) {
