@@ -194,6 +194,38 @@ alloc_node_create() {
     return node;
 }
 
+struct dump_call_path_arg {
+    struct profile_context* pcontext;
+    lua_State* L;
+    uint64_t index;
+    uint64_t cpu_samples_sum;
+    uint64_t alloc_bytes_sum;
+    uint64_t free_bytes_sum;
+    uint64_t alloc_times_sum;
+    uint64_t free_times_sum;
+    uint64_t realloc_times_sum;
+};
+
+static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct profile_context* pcontext, lua_State* L) {
+    arg->pcontext = pcontext;
+    arg->L = L;
+    arg->index = 0;
+    arg->cpu_samples_sum = 0;
+    arg->alloc_bytes_sum = 0;
+    arg->free_bytes_sum = 0;
+    arg->alloc_times_sum = 0;
+    arg->free_times_sum = 0;
+    arg->realloc_times_sum = 0;
+}
+
+struct sum_root_stat_arg {
+    uint64_t real_cost_sum;
+};
+
+static void _init_sum_root_stat_arg(struct sum_root_stat_arg* arg) {
+    arg->real_cost_sum = 0;
+}
+
 static inline char*
 pstrdup(const char* s) {
     if (!s) return NULL;
@@ -774,33 +806,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
     context->running_in_hook = false;
 }
 
-
-struct dump_call_path_arg {
-    struct profile_context* pcontext;
-    lua_State* L;
-    uint64_t index;
-    uint64_t real_cost_sum;
-    uint64_t cpu_samples_sum;
-    uint64_t alloc_bytes_sum;
-    uint64_t free_bytes_sum;
-    uint64_t alloc_times_sum;
-    uint64_t free_times_sum;
-    uint64_t realloc_times_sum;
-};
-
-static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct profile_context* pcontext, lua_State* L) {
-    arg->pcontext = pcontext;
-    arg->L = L;
-    arg->index = 0;
-    arg->real_cost_sum = 0;
-    arg->cpu_samples_sum = 0;
-    arg->alloc_bytes_sum = 0;
-    arg->free_bytes_sum = 0;
-    arg->alloc_times_sum = 0;
-    arg->free_times_sum = 0;
-    arg->realloc_times_sum = 0;
-}
-
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
 
 static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
@@ -824,11 +829,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
 
-    if (node->parent == NULL) {
-        arg->real_cost_sum = node->real_cost;
-        node->real_cost = arg->real_cost_sum;
-    }
-
     // 本节点的聚合指标=本节点指标+所有子结点的指标
     uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
     uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
@@ -842,7 +842,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
-    arg->real_cost_sum += node->real_cost;
     arg->cpu_samples_sum += cpu_samples_incl;
     arg->alloc_bytes_sum += alloc_bytes_incl;
     arg->free_bytes_sum += free_bytes_incl;
@@ -902,10 +901,34 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 }
 
-static void dump_call_path(struct profile_context* context, lua_State* L, struct icallpath_context* path) {
+
+static void sum_root_stat(uint64_t key, void* value, void* ud) {
+    struct sum_root_stat_arg* arg = (struct sum_root_stat_arg*)ud;
+    struct icallpath_context* path = (struct icallpath_context*)value;
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    arg->real_cost_sum += node->real_cost;
+    printf("sum_root_stat: %s real_cost_sum: %lu, real_cost: %lu\n", node->name, arg->real_cost_sum, node->real_cost);
+}
+
+static void update_root_stat(struct profile_context* pcontext, lua_State* L) {
+    struct icallpath_context* path = pcontext->callpath;
+    if (!path) return;
+    struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(path);
+    if (!root) return;
+
+    root->last_ret_time = get_mono_ns();
+    if (icallpath_children_size(path) > 0) {
+        struct sum_root_stat_arg arg;
+        _init_sum_root_stat_arg(&arg);
+        icallpath_dump_children(path, sum_root_stat, &arg);
+        root->real_cost = arg.real_cost_sum;
+    }
+}
+
+static void dump_call_path(struct profile_context* pcontext, lua_State* L) {
     struct dump_call_path_arg arg;
-    _init_dump_call_path_arg(&arg, context, L);
-    _dump_call_path(path, &arg);
+    _init_dump_call_path_arg(&arg, pcontext, L);
+    _dump_call_path(pcontext->callpath, &arg);
 }
 
 static int 
@@ -1092,9 +1115,8 @@ _ldump(lua_State* L) {
         } else {
             // tracing dump
             if (context->callpath) {
-                struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
-                root->last_ret_time = cur_time;
-                dump_call_path(context, L, context->callpath);
+                update_root_stat(context, L);
+                dump_call_path(context, L);
             } else {
                 lua_newtable(L);
             }
