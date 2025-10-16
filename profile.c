@@ -133,6 +133,7 @@ struct profile_context {
     int         mem_mode;       // MODE_*
     int         sample_period;  // instruction count for LUA_MASKCOUNT
     uint64_t    rng_state;      // RNG state for sampling gaps
+    uint64_t    profile_cost_ns;
 };
 
 struct callpath_node {
@@ -311,6 +312,7 @@ profile_create() {
     context->mem_mode = MODE_PROFILE;       // default: profile
     context->sample_period = DEFAULT_SAMPLE_PERIOD; // default instruction period for sampling
     context->rng_state = 0;
+    context->profile_cost_ns = 0;
     return context;
 }
 
@@ -679,6 +681,8 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
 // hook call/ret 事件
 static void
 _hook_call(lua_State* L, lua_Debug* far) {
+    uint64_t begin_time = get_mono_ns();
+
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("resolve hook fail, profile not started\n");
@@ -690,7 +694,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
     context->running_in_hook = true;
 
-    uint64_t cur_time = get_mono_ns();
     int event = far->event;
 
     // COUNT 事件优先处理：采样只抓栈
@@ -734,6 +737,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
             printf("set hook with gap %d\n", gap);
             lua_sethook(L, _hook_call, LUA_MASKCOUNT, gap);
         }
+        context->profile_cost_ns += (get_mono_ns() - begin_time);
         context->running_in_hook = false;
         return;
     }
@@ -751,13 +755,13 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
 
         if (context->cur_cs) {
-            context->cur_cs->leave_time = cur_time;
+            context->cur_cs->leave_time = begin_time;
         }
         context->cur_cs = cs;
     }
     if (cs->leave_time > 0) {
-        assert(cur_time >= cs->leave_time);
-        uint64_t co_cost = cur_time - cs->leave_time;
+        assert(begin_time >= cs->leave_time);
+        uint64_t co_cost = begin_time - cs->leave_time;
 
         for (int i = 0; i < cs->top; i++) {
             cs->call_list[i].co_cost += co_cost;
@@ -775,13 +779,13 @@ _hook_call(lua_State* L, lua_Debug* far) {
         struct call_frame* frame = push_callframe(cs);
         frame->tail = (event == LUA_HOOKTAILCALL);
         frame->co_cost = 0;
-        frame->call_time = cur_time;
         frame->prototype = _get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
         if (frame->path) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
             ++node->call_count;
         }
+        frame->call_time = get_mono_ns();
 
     } else if (event == LUA_HOOKRET) {
         if (cs->top <= 0) {
@@ -792,10 +796,10 @@ _hook_call(lua_State* L, lua_Debug* far) {
         do {
             struct call_frame* cur_frame = pop_callframe(cs);
             struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
-            uint64_t total_cost = cur_time - cur_frame->call_time;
+            uint64_t total_cost = begin_time - cur_frame->call_time;
             uint64_t real_cost = total_cost - cur_frame->co_cost;
-            assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
-            cur_path->last_ret_time = cur_time;
+            assert(begin_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
+            cur_path->last_ret_time = begin_time;
             cur_path->real_cost += real_cost;
 
             struct call_frame* pre_frame = cur_callframe(cs);
@@ -803,6 +807,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
         } while(tail_call);
     }
 
+    context->profile_cost_ns += (get_mono_ns() - begin_time);
     context->running_in_hook = false;
 }
 
@@ -898,6 +903,11 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
         lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
         lua_setfield(arg->L, -2, "inuse_bytes");
+    }
+
+    if (path == arg->pcontext->callpath) {
+        lua_pushinteger(arg->L, arg->pcontext->profile_cost_ns);
+        lua_setfield(arg->L, -2, "profile_cost_ns");
     }
 }
 

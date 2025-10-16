@@ -12,3 +12,4 @@ compile_commands.json
 design/
 cpu-samples.txt
 cpu-samples.svg
+profile_result.txt

@@ -8,6 +8,17 @@ local c = require "luaprofilec"
 
 local g_storage = {}
 
+local function write_profile_result(str)
+    local file, err = io.open(root .. "profile_result.txt", "a")
+    if not file then
+        io.stderr:write("open file failed: " .. tostring(err) .. "\n")
+        return false
+    end
+    file:write(str, "\n")
+    file:close()
+    return true
+end
+
 local function test3()
     local t = {}
     local s = 0
@@ -49,7 +60,7 @@ local function test_storage2()
     end
 end
 
-local function do_test()
+local function do_test1()
     test_storage1()
     test_storage2()
     tonumber("123")    
@@ -60,8 +71,29 @@ local function do_test()
     test_vccl()    
 end
 
+local function test_11()
+    local t = {}
+    for i = 1, 100000 do
+        table.insert(t, i)
+    end
+    return t
+end
+
+local function test_12()
+    local t = {}
+    for i = 1, 100000 do
+        table.insert(t, i)
+    end
+    return t
+end
+
+local function do_test()
+    test_11()
+    test_12()
+end
+
 local function test_with_profile()
-    local opts = { cpu = "profile", mem = "off", sample_period = 1 }
+    local opts = { cpu = "profile", mem = "profile", sample_period = 1 }
     profile.start(opts)
     local t1 = c.getmonons()
     do_test()
@@ -69,6 +101,7 @@ local function test_with_profile()
     local result = profile.stop()
     local strResult = json.encode(result)
     print(strResult)
+    write_profile_result(strResult)
     return t2 - t1
 end
 
