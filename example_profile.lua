@@ -95,9 +95,9 @@ end
 local function test_with_profile()
     local opts = { cpu = "profile", mem = "profile", sample_period = 1 }
     profile.start(opts)
-    local t1 = c.getmonons()
+    local t1 = c.getnanosec()
     do_test()
-    local t2 = c.getmonons()
+    local t2 = c.getnanosec()
     local result = profile.stop()
     local strResult = json.encode(result)
     print(strResult)
@@ -106,9 +106,9 @@ local function test_with_profile()
 end
 
 local function test_without_profile()
-    local t1 = c.getmonons()
+    local t1 = c.getnanosec()
     do_test()
-    local t2 = c.getmonons()
+    local t2 = c.getnanosec()
     return t2 - t1
 end
 

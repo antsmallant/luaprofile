@@ -1136,7 +1136,7 @@ _ldump(lua_State* L) {
     return 0;
 }
 
-static int _lgetmonons(lua_State* L) {
+static int _lget_mono_ns(lua_State* L) {
     lua_pushinteger(L, get_mono_ns());
     return 1;
 }
@@ -1150,7 +1150,7 @@ luaopen_luaprofilec(lua_State* L) {
         {"mark", _lmark},
         {"unmark", _lunmark},
         {"dump", _ldump},
-        {"getmonons", _lgetmonons},
+        {"getnanosec", _lget_mono_ns},
         {NULL, NULL},
     };
     luaL_newlib(L, l);
