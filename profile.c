@@ -521,7 +521,7 @@ static inline struct callpath_node* _current_leaf_node(struct profile_context* c
 }
 
 /*
-获取所有类型的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
+获取各种类型函数的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
 如果没有正确获取 prototype，那么像 tonumber 和 print 这类 LUA_VLCF 使用栈上的函数指针来充当 prototype,
 会导致同一层的这类函数被合并为同一个节点，比如下面的代码，最终 print 会错误的合并到 tonumber 的节点中，显示为
 2 次 tonumber 调用。 
@@ -564,40 +564,6 @@ static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
         printf("get prototype by getinfo: %p\n", proto);
     }
     return proto;
-}
-
-// Ensure symbol_map has an entry for the given prototype
-static inline void _ensure_symbol(struct profile_context* context, lua_State* L, lua_Debug* ar, const void* proto) {
-    uint64_t sym_key = (uint64_t)((uintptr_t)proto);
-    if (imap_query(context->symbol_map, sym_key) != NULL) return;
-
-    const char* name = ar->name;
-    int line = ar->linedefined;
-    const char* source = ar->source;
-    char flag = ar->what[0];
-
-    struct symbol_info* si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
-    if (flag == 'C') {
-        // C 帧：不要绑定到 Lua 行号；优先使用 name，缺失则用指针占位
-        char buf[64];
-        const char* nm = name;
-        if (!nm) {
-            snprintf(buf, sizeof(buf)-1, "cfunc@%p", proto);
-            nm = buf;
-        }
-        si->name = pstrdup(nm);
-        si->source = pstrdup("=[C]");
-        si->line = 0;
-    } else {
-        const char* nm = name;
-        if (!nm) {
-            nm = (line == 0) ? "chunk" : "anonymous";
-        }
-        si->name = pstrdup(nm);
-        si->source = pstrdup(source ? source : "");
-        si->line = line;
-    }
-    imap_set(context->symbol_map, sym_key, si);
 }
 
 // hook alloc/free/realloc 事件
@@ -645,7 +611,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // realloc
         
         // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
-        // 1、旧 node，free_bytes 加上 oldsizesize；
+        // 1、旧 node，free_bytes 加上 oldsize；
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1；
 
         // 旧路径
@@ -695,52 +661,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
     context->running_in_hook = true;
 
     int event = far->event;
-
-    // COUNT 事件优先处理：采样只抓栈
-    if (event == LUA_HOOKCOUNT) {
-        // 抓栈 → 生成折叠 key（prototype 地址串）→ 在 sample_map 中累加计数
-        void* frames[MAX_SAMPLE_DEPTH];
-        int depth = 0;
-        lua_Debug ar;
-        while (depth < MAX_SAMPLE_DEPTH && lua_getstack(L, depth, &ar)) {
-            lua_getinfo(L, "nSl", &ar);
-            const void* proto = _get_prototype(L, &ar);
-            _ensure_symbol(context, L, &ar, proto);
-            frames[depth] = (void*)proto;
-            depth++;
-        }
-        if (depth > 0) {
-            // 估算 key 长度：每帧 2+16 字符 + 分隔符（root->leaf 顺序）
-            size_t bufcap = (size_t)depth * 20 + 1;
-            char* buf = (char*)pmalloc(bufcap);
-            size_t off = 0;
-            for (int i = depth - 1; i >= 0; i--) {
-                int n = snprintf(buf + off, bufcap - off, "%p%s", frames[i], (i == 0 ? "" : ";"));
-                if (n < 0) { off = 0; break; }
-                off += (size_t)n;
-                if (off >= bufcap) { off = bufcap - 1; break; }
-            }
-            if (off > 0) {
-                void* pv = smap_get(context->sample_map, buf);
-                uint64_t* counter = (uint64_t*)pv;
-                if (!counter) {
-                    counter = (uint64_t*)pmalloc(sizeof(uint64_t));
-                    *counter = 0;
-                    smap_set(context->sample_map, buf, counter);
-                }
-                *counter += 1;
-            }
-            pfree(buf);
-        }
-        if (context->cpu_mode == MODE_SAMPLE) {
-            int gap = next_exponential_gap(context);
-            printf("set hook with gap %d\n", gap);
-            lua_sethook(L, _hook_call, LUA_MASKCOUNT, gap);
-        }
-        context->profile_cost_ns += (get_mono_ns() - begin_time);
-        context->running_in_hook = false;
-        return;
-    }
 
     struct call_state* cs = context->cur_cs;
     if (!context->cur_cs || context->cur_cs->co != L) {
@@ -971,12 +891,7 @@ _hook_all_co(lua_State* L) {
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
-        if (ctx && ctx->cpu_mode == MODE_SAMPLE) {
-            // sampling: instruction-count based with exponential gaps
-            int gap = next_exponential_gap(ctx);
-            printf("set hook with gap %d\n", gap);
-            lua_sethook(states[i], _hook_call, LUA_MASKCOUNT, gap);
-        } else if (ctx && ctx->cpu_mode == MODE_PROFILE) {
+        if (ctx && ctx->cpu_mode == MODE_PROFILE) {
             // profiling (full call/ret)
             lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
         }
