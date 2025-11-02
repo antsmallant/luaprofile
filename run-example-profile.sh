@@ -1,3 +1,3 @@
 #!/bin/bash
 
-./build/lua-5.4.8/install/bin/lua example_profile.lua
+./3rd/lua-5.4.8/install/bin/lua example_profile.lua
