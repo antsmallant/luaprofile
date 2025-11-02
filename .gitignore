@@ -6,7 +6,6 @@ old_profile.lua
 *.out
 test.lua
 *.dSYM
-build/
 .cache/
 compile_commands.json
 design/
