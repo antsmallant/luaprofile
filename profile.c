@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <errno.h>
 
 /*
 callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
@@ -1056,6 +1058,30 @@ static int _lget_mono_ns(lua_State* L) {
     return 1;
 }
 
+// sleep(seconds): 使用 POSIX nanosleep，支持小数秒，自动处理被信号打断
+static int _lsleep(lua_State* L) {
+    lua_Number sec = luaL_checknumber(L, 1);
+    if (sec < 0) sec = 0;
+
+    lua_Number integral = 0;
+    lua_Number frac = modf(sec, &integral);
+
+    struct timespec req;
+    req.tv_sec = (time_t)integral;
+    long nsec = (long)(frac * 1000000000.0);
+    if (nsec < 0) nsec = 0;
+    if (nsec >= 1000000000L) {
+        req.tv_sec += 1;
+        nsec -= 1000000000L;
+    }
+    req.tv_nsec = nsec;
+
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+        // 被信号中断则继续睡剩余时间
+    }
+    return 0;
+}
+
 int
 luaopen_luaprofilec(lua_State* L) {
     luaL_checkversion(L);
@@ -1066,6 +1092,7 @@ luaopen_luaprofilec(lua_State* L) {
         {"unmark", _lunmark},
         {"dump", _ldump},
         {"getnanosec", _lget_mono_ns},
+        {"sleep", _lsleep},
         {NULL, NULL},
     };
     luaL_newlib(L, l);

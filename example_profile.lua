@@ -6,6 +6,16 @@ local profile = require "profile"
 local json = require "json"
 local c = require "luaprofilec"
 
+-- 带时间戳的打印：[YYYY-MM-DD HH:MM:SS] 后跟原始内容
+local function print_ts(...)
+    local ts = os.date("%Y-%m-%d %H:%M:%S")
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[i] = tostring(select(i, ...))
+    end
+    io.stdout:write("[" .. ts .. "] ", table.concat(parts, "\t"), "\n")
+end
+
 local g_storage = {}
 
 local function write_profile_result(str)
@@ -93,6 +103,7 @@ local function do_test()
 end
 
 local function test_with_profile()
+    print_ts("test_with_profile start")
     local opts = { cpu = "profile", mem = "profile", sample_period = 1 }
     profile.start(opts)
     local t1 = c.getnanosec()
@@ -102,6 +113,7 @@ local function test_with_profile()
     local strResult = json.encode(result)
     print(strResult)
     write_profile_result(strResult)
+    print_ts("test_with_profile stop")
     return t2 - t1
 end
 
