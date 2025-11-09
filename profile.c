@@ -1161,59 +1161,69 @@ static void record_lua_sample_weight(lua_State* L, unsigned int weight) {
     const void* protos[MAX_SAMPLE_DEPTH];
     int nframes = 0;
 
-    CallInfo* ci = L->ci;
-    while (ci && nframes < MAX_SAMPLE_DEPTH) {
-        const TValue* tv = s2v(ci->func.p);
-        const void* proto = NULL;
-        int is_lua = 0;
-        const Proto* lua_p = NULL;
-        if (ttislcf(tv)) {
-            proto = (const void*)fvalue(tv); /* light C function pointer */
-        } else if (ttisclosure(tv)) {
-            const Closure* cl = clvalue(tv);
-            if (cl->c.tt == LUA_VLCL) {
-                lua_p = cl->l.p;
-                proto = (const void*)lua_p; /* Lua Proto* */
-                is_lua = 1;
-            } else if (cl->c.tt == LUA_VCCL) {
-                proto = (const void*)cl->c.f; /* C closure function */
-            }
-        }
-        if (proto) {
-            /* ensure symbol info */
-            uint64_t sym_key = (uint64_t)((uintptr_t)proto);
-            struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
-            if (!si) {
-                si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
-                if (is_lua && lua_p) {
-                    const char* src = lua_p->source ? getstr(lua_p->source) : "null";
-                    si->name = pstrdup("(lua)");
-                    si->source = pstrdup(src ? src : "null");
-                    si->line = lua_p->linedefined;
-                } else {
-                    si->name = pstrdup("(C)");
-                    si->source = pstrdup("(C)");
-                    si->line = -1;
+    /* 1) 遍历 CallInfo 链，采集自叶到根的 Proto/函数指针，并为每一帧写入符号信息（source/line，占位名） */
+    {
+        CallInfo* ci = L->ci;
+        while (ci && nframes < MAX_SAMPLE_DEPTH) {
+            const TValue* tv = s2v(ci->func.p);
+            const void* proto = NULL;
+            const Proto* lua_p = NULL;
+
+            if (ttislcf(tv)) {
+                proto = (const void*)fvalue(tv); /* 轻量 C 函数 */
+            } else if (ttisclosure(tv)) {
+                const Closure* cl = clvalue(tv);
+                if (cl->c.tt == LUA_VLCL) {
+                    lua_p = cl->l.p;            /* Lua 函数 */
+                    proto = (const void*)lua_p;
+                } else if (cl->c.tt == LUA_VCCL) {
+                    proto = (const void*)cl->c.f; /* C 闭包 */
                 }
-                imap_set(context->symbol_map, sym_key, si);
             }
-            protos[nframes++] = proto;
+
+            if (proto) {
+                uint64_t sym_key = (uint64_t)((uintptr_t)proto);
+                struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
+                if (!si) {
+                    si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+                    if (lua_p) {
+                        const char* src = lua_p->source ? getstr(lua_p->source) : "null";
+                        si->name = pstrdup("(lua)");
+                        si->source = pstrdup(src ? src : "null");
+                        si->line = lua_p->linedefined;
+                    } else {
+                        si->name = pstrdup("(C)");
+                        si->source = pstrdup("(C)");
+                        si->line = -1;
+                    }
+                    imap_set(context->symbol_map, sym_key, si);
+                }
+                protos[nframes++] = proto;
+            }
+            ci = ci->previous;
         }
-        ci = ci->previous;
     }
-    // Best-effort: fill function names for all frames using debug API (names only)
-    if (nframes > 0) {
+
+    /* 2) 为每一帧按需补齐函数名：仅当缓存里是占位名时，才调用 debug API 获取 name */
+    {
         lua_Debug ar;
         for (int lvl = 0; lvl < nframes; ++lvl) {
-            if (lua_getstack(L, lvl, &ar)) {
-                if (lua_getinfo(L, "n", &ar), ar.name && ar.name[0]) {
-                    uint64_t sk = (uint64_t)((uintptr_t)protos[lvl]);
-                    struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sk);
-                    if (si) {
-                        if (si->name) pfree(si->name);
-                        si->name = pstrdup(ar.name);
-                    }
+            uint64_t sk = (uint64_t)((uintptr_t)protos[lvl]);
+            struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sk);
+            if (si && si->name && si->name[0] != '(') {
+                continue; /* 缓存已有人类可读的函数名，跳过 */
+            }
+            if (!lua_getstack(L, lvl, &ar)) break;
+            if (lua_getinfo(L, "n", &ar), ar.name && ar.name[0]) {
+                if (!si) {
+                    si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+                    si->source = pstrdup("unknown");
+                    si->line = -1;
+                    imap_set(context->symbol_map, sk, si);
+                } else if (si->name) {
+                    pfree(si->name);
                 }
+                si->name = pstrdup(ar.name);
             }
         }
     }
