@@ -18,14 +18,16 @@ end
 
 local function test2()
     for i = 1, 500000 do
-        print(i)
+        -- print(i)
+        tonumber("123")    
         test3()
     end    
 end
 
 local function test22()
     for i = 1, 500000 do
-        print(i)
+        -- print(i)
+        tonumber("123")    
         test3()
     end    
 end

@@ -1,4 +1,7 @@
 // This file is modified version from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 
 #include "profile.h"
 #include "imap.h"
@@ -19,6 +22,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/ucontext.h>
+#include <dlfcn.h>
 
 /*
 callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
@@ -59,6 +64,38 @@ static void stop_thread_timer(void);
 static __thread lua_State* g_prof_current_L = NULL;
 static __thread timer_t g_prof_timerid;
 static int g_prof_signo = 0; // assigned on install
+static __thread uintptr_t g_stack_lo = 0;
+static __thread uintptr_t g_stack_hi = 0;
+static char g_self_module[128];
+
+#define C_RB_CAP 8192
+#define C_MAX_FRAMES 64
+typedef struct {
+    uint16_t depth;
+    uintptr_t pcs[C_MAX_FRAMES];
+} c_sample_t;
+static __thread c_sample_t g_c_rb[C_RB_CAP];
+static __thread unsigned g_c_rb_head = 0;
+
+/* write helpers (async-signal-safe) */
+static inline void _hex_nibble(char n, char* out) {
+    *out = (n < 10) ? ('0' + n) : ('a' + (n - 10));
+}
+static size_t _hex_ptr(uintptr_t v, char* buf) {
+    char tmp[2 + sizeof(uintptr_t) * 2];
+    size_t p = 0;
+    tmp[p++] = '0'; tmp[p++] = 'x';
+    int started = 0;
+    for (int i = (int)(sizeof(uintptr_t) * 2 - 1); i >= 0; --i) {
+        char nib = (char)((v >> (i * 4)) & 0xf);
+        if (!started && nib == 0 && i != 0) continue;
+        started = 1;
+        _hex_nibble(nib, tmp + p);
+        p++;
+    }
+    for (size_t i = 0; i < p; ++i) buf[i] = tmp[i];
+    return p;
+}
 
 static void prof_sig_handler(int sig, siginfo_t* si, void* uctx) {
     (void)sig; (void)si; (void)uctx;
@@ -68,6 +105,43 @@ static void prof_sig_handler(int sig, siginfo_t* si, void* uctx) {
             L->prof_ticks++;
         }
     }
+
+    /* Grab C stack (best-effort, x86_64) and print one folded line to stderr */
+#if defined(__x86_64__)
+    ucontext_t* ctx = (ucontext_t*)uctx;
+    uintptr_t ip = 0, bp = 0;
+# ifdef REG_RIP
+    ip = (uintptr_t)ctx->uc_mcontext.gregs[REG_RIP];
+# endif
+# ifdef REG_RBP
+    bp = (uintptr_t)ctx->uc_mcontext.gregs[REG_RBP];
+# endif
+    /* collect frames into TLS ring buffer */
+    unsigned idx = g_c_rb_head++ % C_RB_CAP;
+    c_sample_t* cs = &g_c_rb[idx];
+    cs->depth = 0;
+    if (ip && cs->depth < C_MAX_FRAMES) {
+        cs->pcs[cs->depth++] = ip;
+    }
+    uintptr_t lo = g_stack_lo, hi = g_stack_hi;
+    int depth = 0;
+    while (bp && bp >= lo && (bp + 2 * sizeof(uintptr_t)) < hi && depth < 64) {
+        /* ret address at [bp + sizeof(void*)], next bp at [bp] */
+        uintptr_t next_bp = 0;
+        uintptr_t ret = 0;
+        /* guard against invalid memory by simple bounds checks */
+        next_bp = *((uintptr_t*)bp);
+        ret = *((uintptr_t*)(bp + sizeof(uintptr_t)));
+        if (next_bp <= bp || next_bp >= hi) break;
+        if (cs->depth < C_MAX_FRAMES) {
+            cs->pcs[cs->depth++] = ret;
+        }
+        bp = next_bp;
+        depth++;
+    }
+#else
+    (void)uctx;
+#endif
 }
 
 static int install_prof_signal_once(void) {
@@ -80,12 +154,37 @@ static int install_prof_signal_once(void) {
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
     if (sigaction(signo, &sa, NULL) != 0) return -1;
     g_prof_signo = signo;
+    /* identify our own module basename for later frame filtering */
+    Dl_info di;
+    if (dladdr((void*)&prof_sig_handler, &di) && di.dli_fname) {
+        const char* base = strrchr(di.dli_fname, '/');
+        base = base ? base + 1 : di.dli_fname;
+        size_t n = strlen(base);
+        if (n >= sizeof(g_self_module)) n = sizeof(g_self_module) - 1;
+        memcpy(g_self_module, base, n);
+        g_self_module[n] = '\0';
+    } else {
+        g_self_module[0] = '\0';
+    }
     return 0;
 }
 
 static int start_thread_timer_hz(int hz) {
     if (hz <= 0) hz = 250;
     if (install_prof_signal_once() != 0) return -1;
+    /* cache stack bounds for safe FP walk */
+    {
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            void* stackaddr = NULL;
+            size_t stacksize = 0;
+            if (pthread_attr_getstack(&attr, &stackaddr, &stacksize) == 0) {
+                g_stack_lo = (uintptr_t)stackaddr;
+                g_stack_hi = (uintptr_t)stackaddr + stacksize;
+            }
+            pthread_attr_destroy(&attr);
+        }
+    }
     struct sigevent sev;
     memset(&sev, 0, sizeof(sev));
 #ifdef SIGEV_THREAD_ID
@@ -200,7 +299,8 @@ struct profile_context {
     struct imap_context*        cs_map;
     struct imap_context*        alloc_map;
     struct imap_context*        symbol_map;
-    smap_t*                     sample_map;   // folded stacks for cpu sampling
+    smap_t*                     sample_map;   // folded stacks for lua cpu sampling
+    smap_t*                     c_sample_map; // folded stacks for c cpu sampling
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
     int         cpu_mode;       // MODE_*
@@ -367,6 +467,15 @@ static void _fg_dump_cb(const char* key, void* value, void* ud) {
     if (m > 0) luaL_addlstring(b, tail, (size_t)m);
 }
 
+/* write c_sample_map entries to file */
+static void _cmap_write_cb(const char* key, void* value, void* ud) {
+    FILE* fp = (FILE*)ud;
+    if (!fp) return;
+    uint64_t samples = value ? *(uint64_t*)value : 0;
+    if (samples == 0) return;
+    fprintf(fp, "%s %llu\n", key, (unsigned long long)samples);
+}
+
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -377,6 +486,7 @@ profile_create() {
     context->alloc_map = imap_create();
     context->symbol_map = imap_create();
     context->sample_map = smap_create(2048);
+    context->c_sample_map = smap_create(2048);
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->running_in_hook = false;
@@ -430,6 +540,10 @@ profile_free(struct profile_context* context) {
         // free smap entries' values (uint64_t*)
         smap_iterate(context->sample_map, _free_counter_cb, NULL);
         smap_free(context->sample_map);
+    }
+    if (context->c_sample_map) {
+        smap_iterate(context->c_sample_map, _free_counter_cb, NULL);
+        smap_free(context->c_sample_map);
     }
     imap_dump(context->alloc_map, _ob_free_alloc_node, NULL);
     imap_free(context->alloc_map);
@@ -1108,6 +1222,84 @@ static int
 _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
+        /* fold C stack TLS buffer into c_sample_map using dladdr */
+        if (context->c_sample_map) {
+            unsigned cap = C_RB_CAP;
+            for (unsigned i = 0; i < cap; ++i) {
+                c_sample_t* cs = &g_c_rb[i];
+                if (cs->depth == 0) continue;
+                char keybuf[4096];
+                size_t kp = 0;
+                /* choose start index: skip frames belonging to our module or vdso/sig trampolines */
+                int start_idx = 0;
+                for (int d = 0; d < cs->depth; ++d) {
+                    Dl_info info;
+                    const char* so = NULL;
+                    const char* name = NULL;
+                    if (dladdr((void*)cs->pcs[d], &info)) {
+                        so = info.dli_fname;
+                        name = info.dli_sname;
+                    }
+                    const char* base = so ? strrchr(so, '/') : NULL;
+                    base = base ? base + 1 : so;
+                    int is_self = (base && g_self_module[0] && strcmp(base, g_self_module) == 0);
+                    int is_vdso = (base && strstr(base, "linux-vdso") != NULL);
+                    int is_sigret = (name && (strstr(name, "__restore_rt") || strstr(name, "rt_sigreturn")));
+                    if (!(is_self || is_vdso || is_sigret)) {
+                        start_idx = d;
+                        break;
+                    }
+                }
+                for (int d = start_idx; d < cs->depth; ++d) {
+                    Dl_info info;
+                    const char* name = NULL;
+                    const char* so = NULL;
+                    if (dladdr((void*)cs->pcs[d], &info)) {
+                        if (info.dli_sname && info.dli_sname[0]) name = info.dli_sname;
+                        if (info.dli_fname && info.dli_fname[0]) so = info.dli_fname;
+                    }
+                    /* build display name */
+                    char namebuf[384];
+                    if (name && name[0]) {
+                        /* module!symbol+offset */
+                        uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
+                        uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : 0;
+                        const char* modbase = so ? (strrchr(so, '/') ? strrchr(so, '/') + 1 : so) : "unknown";
+                        snprintf(namebuf, sizeof(namebuf), "%s!%s+0x%lx", modbase, name, (unsigned long)off);
+                    } else if (so && so[0]) {
+                        /* basename(so)+offset */
+                        const char* base = strrchr(so, '/');
+                        base = base ? base + 1 : so;
+                        uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
+                        uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : (uintptr_t)cs->pcs[d];
+                        snprintf(namebuf, sizeof(namebuf), "%s+0x%lx", base, (unsigned long)off);
+                    } else {
+                        char hex[2 + sizeof(uintptr_t) * 2 + 1];
+                        size_t hn = _hex_ptr(cs->pcs[d], hex);
+                        hex[hn] = '\0';
+                        snprintf(namebuf, sizeof(namebuf), "%s", hex);
+                    }
+                    size_t nlen = strlen(namebuf);
+                    if (kp + nlen + 1 >= sizeof(keybuf)) break;
+                    if (kp > 0) keybuf[kp++] = ';';
+                    memcpy(keybuf + kp, namebuf, nlen);
+                    kp += nlen;
+                }
+                keybuf[kp] = '\0';
+                if (kp > 0) {
+                    uint64_t* cnt = (uint64_t*)smap_get(context->c_sample_map, keybuf);
+                    if (!cnt) {
+                        char* keydup = pstrdup(keybuf);
+                        cnt = (uint64_t*)pmalloc(sizeof(uint64_t));
+                        *cnt = 0;
+                        smap_set(context->c_sample_map, keydup, cnt);
+                    }
+                    (*cnt)++;
+                }
+                /* clear entry for next round */
+                cs->depth = 0;
+            }
+        }
         // full gc
         lua_gc(L, LUA_GCCOLLECT, 0);
 
@@ -1126,6 +1318,14 @@ _ldump(lua_State* L) {
             struct fg_dump_ctx fctx = { .buf = &b, .symbol_map = context->symbol_map };
             smap_iterate(context->sample_map, _fg_dump_cb, &fctx);
             luaL_pushresult(&b);
+            /* also write C stacks (names already resolved in keys) to a file */
+            {
+                FILE* fp = fopen("cpu-c-samples.txt", "w");
+                if (fp) {
+                    smap_iterate(context->c_sample_map, _cmap_write_cb, fp);
+                    fclose(fp);
+                }
+            }
         } else {
             // tracing dump
             if (context->callpath) {
