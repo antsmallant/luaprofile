@@ -5,6 +5,7 @@
 #include "smap.h"
 #include "icallpath.h"
 #include "lobject.h"
+#include "lfunc.h"
 #include "lstate.h"
 #include "lua.h"
 #include "lauxlib.h"
@@ -1150,33 +1151,75 @@ static int _lget_mono_ns(lua_State* L) {
 
 
 // Construct folded key and ensure symbol info
+/* Safe stack sampler: does NOT call Lua debug API; walks CallInfo chain */
 static void record_lua_sample_weight(lua_State* L, unsigned int weight) {
     struct profile_context* context = get_profile_context(L);
     if (!context || context->cpu_mode != MODE_SAMPLE || context->running_in_hook) return;
     context->running_in_hook = true;
     char keybuf[4096];
     size_t kp = 0;
-    lua_Debug ar;
-    int depth = 0;
     const void* protos[MAX_SAMPLE_DEPTH];
     int nframes = 0;
-    while (depth < MAX_SAMPLE_DEPTH && lua_getstack(L, depth, &ar)) {
-        lua_getinfo(L, "nSl", &ar);
-        const void* proto = _get_prototype(L, &ar);
-        // ensure symbol
-        uint64_t sym_key = (uint64_t)((uintptr_t)proto);
-        struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
-        if (!si) {
-            si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
-            si->name = pstrdup(ar.name ? ar.name : "null");
-            si->source = pstrdup(ar.source ? ar.source : "null");
-            si->line = ar.linedefined;
-            imap_set(context->symbol_map, sym_key, si);
+
+    CallInfo* ci = L->ci;
+    while (ci && nframes < MAX_SAMPLE_DEPTH) {
+        const TValue* tv = s2v(ci->func.p);
+        const void* proto = NULL;
+        int is_lua = 0;
+        const Proto* lua_p = NULL;
+        if (ttislcf(tv)) {
+            proto = (const void*)fvalue(tv); /* light C function pointer */
+        } else if (ttisclosure(tv)) {
+            const Closure* cl = clvalue(tv);
+            if (cl->c.tt == LUA_VLCL) {
+                lua_p = cl->l.p;
+                proto = (const void*)lua_p; /* Lua Proto* */
+                is_lua = 1;
+            } else if (cl->c.tt == LUA_VCCL) {
+                proto = (const void*)cl->c.f; /* C closure function */
+            }
         }
-        if (nframes < MAX_SAMPLE_DEPTH) protos[nframes++] = proto;
-        depth++;
+        if (proto) {
+            /* ensure symbol info */
+            uint64_t sym_key = (uint64_t)((uintptr_t)proto);
+            struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
+            if (!si) {
+                si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+                if (is_lua && lua_p) {
+                    const char* src = lua_p->source ? getstr(lua_p->source) : "null";
+                    si->name = pstrdup("(lua)");
+                    si->source = pstrdup(src ? src : "null");
+                    si->line = lua_p->linedefined;
+                } else {
+                    si->name = pstrdup("(C)");
+                    si->source = pstrdup("(C)");
+                    si->line = -1;
+                }
+                imap_set(context->symbol_map, sym_key, si);
+            }
+            protos[nframes++] = proto;
+        }
+        ci = ci->previous;
     }
+    // Best-effort: fill function names for all frames using debug API (names only)
+    if (nframes > 0) {
+        lua_Debug ar;
+        for (int lvl = 0; lvl < nframes; ++lvl) {
+            if (lua_getstack(L, lvl, &ar)) {
+                if (lua_getinfo(L, "n", &ar), ar.name && ar.name[0]) {
+                    uint64_t sk = (uint64_t)((uintptr_t)protos[lvl]);
+                    struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sk);
+                    if (si) {
+                        if (si->name) pfree(si->name);
+                        si->name = pstrdup(ar.name);
+                    }
+                }
+            }
+        }
+    }
+
     // Build folded key as root->...->leaf (FlameGraph expected order)
+
     for (int idx = nframes - 1; idx >= 0; --idx) {
         char token[32];
         int n = snprintf(token, sizeof(token), "%p", protos[idx]);
