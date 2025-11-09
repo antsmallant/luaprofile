@@ -23,6 +23,13 @@ local function test2()
     end    
 end
 
+local function test22()
+    for i = 1, 500000 do
+        print(i)
+        test3()
+    end    
+end
+
 -- 触发 LUA_VCCL：string.gmatch 返回 C 闭包迭代器（带 upvalues）
 local function test_vccl()
     local acc = 0
@@ -72,6 +79,7 @@ local function test1()
     tonumber("234")
     print("222")
     test2()
+    test22()
     test_vccl()
     local result = profile.stop()
     print("time:",result.time)
