@@ -12,12 +12,13 @@ local function test3()
     local s = 0
     for i = 1, 10 do
         s = s + i
-        table.insert(t, i)
+        t[i] = i
     end
 end
 
 local function test2()
-    for i = 1, 10 do
+    for i = 1, 500000 do
+        print(i)
         test3()
     end    
 end
@@ -60,7 +61,7 @@ local function write_file(path, content)
 end
 
 local function test1()
-    local opts = { cpu = "sample", mem = "sample", sample_period = 1 }
+    local opts = { cpu = "sample", mem = "sample", cpu_sample_hz = 250 }
     profile.start(opts)
     test_storage1()
     test_storage2()

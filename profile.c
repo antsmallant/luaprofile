@@ -14,6 +14,10 @@
 #include <math.h>
 #include <time.h>
 #include <errno.h>
+#include "luaprof.h"
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 /*
 callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
@@ -39,9 +43,76 @@ node1
 #define MODE_PROFILE                1
 #define MODE_SAMPLE                 2
 
-#define DEFAULT_SAMPLE_PERIOD       10000
+#define DEFAULT_CPU_cpu_sample_hz       250
 
 static char profile_context_key = 'x';
+
+
+// forward decl for trap callback implemented later (needs structs defined)
+static void _on_prof_trap_n(lua_State* L, unsigned int n);
+
+#ifdef LUA_PROF_TRAP
+// -------- CPU sampling (TLS + per-thread timer + signal handler) --------
+static int start_thread_timer_hz(int hz);
+static void stop_thread_timer(void);
+static __thread lua_State* g_prof_current_L = NULL;
+static __thread timer_t g_prof_timerid;
+static int g_prof_signo = 0; // assigned on install
+
+static void prof_sig_handler(int sig, siginfo_t* si, void* uctx) {
+    (void)sig; (void)si; (void)uctx;
+    lua_State* L = g_prof_current_L;
+    if (L) {
+        if (L->prof_ticks < 0x7fffffffU) {
+            L->prof_ticks++;
+        }
+    }
+}
+
+static int install_prof_signal_once(void) {
+    if (g_prof_signo != 0) return 0;
+    int signo = SIGRTMIN + 1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = prof_sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    if (sigaction(signo, &sa, NULL) != 0) return -1;
+    g_prof_signo = signo;
+    return 0;
+}
+
+static int start_thread_timer_hz(int hz) {
+    if (hz <= 0) hz = 250;
+    if (install_prof_signal_once() != 0) return -1;
+    struct sigevent sev;
+    memset(&sev, 0, sizeof(sev));
+#ifdef SIGEV_THREAD_ID
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev._sigev_un._tid = (int)syscall(SYS_gettid);
+#else
+    // Fallback: process-directed; acceptable in single-threaded lua
+    sev.sigev_notify = SIGEV_SIGNAL;
+#endif
+    sev.sigev_signo = g_prof_signo;
+    if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &g_prof_timerid) != 0) return -1;
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_nsec = 1000000000LL / hz;
+    its.it_interval.tv_nsec = its.it_value.tv_nsec;
+    if (timer_settime(g_prof_timerid, 0, &its, NULL) != 0) return -1;
+    return 0;
+}
+
+static void stop_thread_timer(void) {
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    timer_settime(g_prof_timerid, 0, &its, NULL);
+    timer_delete(g_prof_timerid);
+    memset(&g_prof_timerid, 0, sizeof(g_prof_timerid));
+}
+#endif
+
 
 // 获取单调递增的时间戳（纳秒），不会被 NTP 调整。
 // 只用于计算时间差，不能当成绝对时间戳用于获取当前的年月日。
@@ -66,13 +137,13 @@ get_realtime_ns() {
     return sec * (uint64_t)NANOSEC + nsec;
 }
 
-// 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample", sample_period = int }
+// 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample", cpu_sample_hz = int }
 static bool
-read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_sample_period) {
-    if (!out_cpu_mode || !out_mem_mode || !out_sample_period) return false;
+read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_cpu_sample_hz) {
+    if (!out_cpu_mode || !out_mem_mode || !out_cpu_sample_hz) return false;
     *out_cpu_mode = MODE_PROFILE;
     *out_mem_mode = MODE_PROFILE;
-    *out_sample_period = DEFAULT_SAMPLE_PERIOD;
+    *out_cpu_sample_hz = DEFAULT_CPU_cpu_sample_hz;
     if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
 
     lua_getfield(L, 1, "cpu");
@@ -95,10 +166,10 @@ read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_sample_per
     }
     lua_pop(L, 1);
 
-    lua_getfield(L, 1, "sample_period");
+    lua_getfield(L, 1, "cpu_sample_hz");
     if (lua_isinteger(L, -1)) {
         int sp = (int)lua_tointeger(L, -1);
-        if (sp > 0) *out_sample_period = sp;
+        if (sp > 0) *out_cpu_sample_hz = sp;
     }
     lua_pop(L, 1);
     return true;
@@ -133,7 +204,7 @@ struct profile_context {
     struct call_state*          cur_cs;
     int         cpu_mode;       // MODE_*
     int         mem_mode;       // MODE_*
-    int         sample_period;  // instruction count for LUA_MASKCOUNT
+    int         cpu_sample_hz;  // instruction count for LUA_MASKCOUNT
     uint64_t    rng_state;      // RNG state for sampling gaps
     uint64_t    profile_cost_ns;
 };
@@ -312,7 +383,7 @@ profile_create() {
     context->last_alloc_ud = NULL;
     context->cpu_mode = MODE_PROFILE;       // default: profile
     context->mem_mode = MODE_PROFILE;       // default: profile
-    context->sample_period = DEFAULT_SAMPLE_PERIOD; // default instruction period for sampling
+    context->cpu_sample_hz = DEFAULT_CPU_cpu_sample_hz; // default: hz for sample
     context->rng_state = 0;
     context->profile_cost_ns = 0;
     return context;
@@ -423,12 +494,12 @@ static inline uint64_t xorshift64(uint64_t* s) {
 }
 
 static inline int next_exponential_gap(struct profile_context* ctx) {
-    // mean = ctx->sample_period (instructions)
+    // mean = ctx->cpu_sample_hz (instructions)
     // u in (0,1], avoid 0
     uint64_t r = xorshift64(&ctx->rng_state);
     double u = ( (r >> 11) * (1.0 / 9007199254740992.0) ); // 53-bit to [0,1)
     if (u <= 0.0) u = 1e-12;
-    int gap = (int)floor(-log(u) * (double)ctx->sample_period);
+    int gap = (int)floor(-log(u) * (double)ctx->cpu_sample_hz);
     if (gap < 1) gap = 1;
     return gap;
 }
@@ -934,8 +1005,8 @@ _lstart(lua_State* L) {
     // parse options: start([opts]), opts is a table
     int cpu_mode = MODE_PROFILE; // default profile
     int mem_mode = MODE_PROFILE; // default profile
-    int sample_period = DEFAULT_SAMPLE_PERIOD;
-    bool read_ok = read_arg(L, &cpu_mode, &mem_mode, &sample_period);
+    int cpu_sample_hz = DEFAULT_CPU_cpu_sample_hz;
+    bool read_ok = read_arg(L, &cpu_mode, &mem_mode, &cpu_sample_hz);
     if (!read_ok) {
         printf("start fail, invalid options\n");
         return 0;
@@ -949,17 +1020,28 @@ _lstart(lua_State* L) {
     context->is_ready = true;
     context->cpu_mode = cpu_mode;
     context->mem_mode = mem_mode;
-    context->sample_period = sample_period;
+    context->cpu_sample_hz = cpu_sample_hz;
     // seed rng with time xor state pointer
     context->rng_state = get_mono_ns() ^ (uint64_t)(uintptr_t)context;
+    
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     if (mem_mode != MODE_OFF) {
         lua_setallocf(L, _hook_alloc, context);
     }
     set_profile_context(L, context);
-    _hook_all_co(L);
+
+    if (cpu_mode == MODE_SAMPLE) {
+        g_prof_current_L = L;
+        lua_prof_set_cb_n(_on_prof_trap_n);        
+        if (start_thread_timer_hz(cpu_sample_hz) != 0) {
+            printf("start thread timer fail\n");
+        }
+    } else if (cpu_mode == MODE_PROFILE || mem_mode != MODE_OFF) {
+        _hook_all_co(L);
+    }
+    
     context->running_in_hook = false;
-    printf("luaprofile started, cpu_mode = %d, mem_mode = %d, sample_period = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->sample_period, context->last_alloc_ud);    
+    printf("luaprofile started, cpu_mode = %d, mem_mode = %d, cpu_sample_hz = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->cpu_sample_hz, context->last_alloc_ud);    
     return 0;
 }
 
@@ -978,6 +1060,11 @@ _lstop(lua_State* L) {
     unset_profile_context(L);
     profile_free(context);
     context = NULL;
+    // stop sampler
+    if (g_prof_timerid) {
+        stop_thread_timer();
+    }
+    g_prof_current_L = NULL;
     printf("luaprofile stopped\n");
     return 0;
 }
@@ -996,6 +1083,7 @@ _lmark(lua_State* L) {
     if(context->is_ready) {
         lua_sethook(co, _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
     }
+    g_prof_current_L = co;
     lua_pushboolean(L, context->is_ready);
     return 1;
 }
@@ -1056,6 +1144,65 @@ _ldump(lua_State* L) {
 static int _lget_mono_ns(lua_State* L) {
     lua_pushinteger(L, get_mono_ns());
     return 1;
+}
+
+// -------- CPU sampling (timer + trap callback) --------
+
+
+// Construct folded key and ensure symbol info
+static void record_lua_sample_weight(lua_State* L, unsigned int weight) {
+    struct profile_context* context = get_profile_context(L);
+    if (!context || context->cpu_mode != MODE_SAMPLE || context->running_in_hook) return;
+    context->running_in_hook = true;
+    char keybuf[4096];
+    size_t kp = 0;
+    lua_Debug ar;
+    int depth = 0;
+    const void* protos[MAX_SAMPLE_DEPTH];
+    int nframes = 0;
+    while (depth < MAX_SAMPLE_DEPTH && lua_getstack(L, depth, &ar)) {
+        lua_getinfo(L, "nSl", &ar);
+        const void* proto = _get_prototype(L, &ar);
+        // ensure symbol
+        uint64_t sym_key = (uint64_t)((uintptr_t)proto);
+        struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
+        if (!si) {
+            si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+            si->name = pstrdup(ar.name ? ar.name : "null");
+            si->source = pstrdup(ar.source ? ar.source : "null");
+            si->line = ar.linedefined;
+            imap_set(context->symbol_map, sym_key, si);
+        }
+        if (nframes < MAX_SAMPLE_DEPTH) protos[nframes++] = proto;
+        depth++;
+    }
+    // Build folded key as root->...->leaf (FlameGraph expected order)
+    for (int idx = nframes - 1; idx >= 0; --idx) {
+        char token[32];
+        int n = snprintf(token, sizeof(token), "%p", protos[idx]);
+        if (n > 0) {
+            if (kp + (size_t)n + 1 < sizeof(keybuf)) {
+                if (kp > 0) keybuf[kp++] = ';';
+                memcpy(keybuf + kp, token, (size_t)n);
+                kp += (size_t)n;
+            } else break;
+        }
+    }
+    keybuf[kp] = '\0';
+    if (kp > 0) {
+        uint64_t* cnt = (uint64_t*)smap_get(context->sample_map, keybuf);
+        if (!cnt) {
+            cnt = (uint64_t*)pmalloc(sizeof(uint64_t));
+            *cnt = 0;
+            smap_set(context->sample_map, keybuf, cnt);
+        }
+        (*cnt) += (uint64_t)(weight ? weight : 1);
+    }
+    context->running_in_hook = false;
+}
+
+static void _on_prof_trap_n(lua_State* L, unsigned int n) {
+    record_lua_sample_weight(L, n);
 }
 
 // sleep(seconds): 使用 POSIX nanosleep，支持小数秒，自动处理被信号打断

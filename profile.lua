@@ -24,14 +24,14 @@ end
 local g_profile_started = false
 local g_opts = nil
 
--- opts = { cpu = "off|profile|sample", mem = "off|profile|sample", sample_period = 10000 }
+-- opts = { cpu = "off|profile|sample", mem = "off|profile|sample", cpu_sample_hz = 250 }
 function M.start(opts)
     if g_profile_started then
         print("profile start fail, already started")
         return
     end
     g_profile_started = true
-    g_opts = opts or { cpu = "profile", mem = "profile", sample_period = 10000 }
+    g_opts = opts or { cpu = "profile", mem = "profile", cpu_sample_hz = 250 }
     c.start(g_opts)
     coroutine.create = my_coroutine_create
     coroutine.wrap = my_coroutine_wrap

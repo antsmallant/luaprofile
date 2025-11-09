@@ -104,7 +104,7 @@ end
 
 local function test_with_profile()
     print_ts("test_with_profile start")
-    local opts = { cpu = "profile", mem = "profile", sample_period = 1 }
+    local opts = { cpu = "profile", mem = "profile", cpu_sample_hz = 250 }
     profile.start(opts)
     local t1 = c.getnanosec()
     do_test()
