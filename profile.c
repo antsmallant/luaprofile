@@ -476,6 +476,197 @@ static void _cmap_write_cb(const char* key, void* value, void* ud) {
     fprintf(fp, "%s %llu\n", key, (unsigned long long)samples);
 }
 
+/* ---- Dump helpers (refactor) ---- */
+static void fold_c_tls_samples(struct profile_context* context) {
+    if (!context || !context->c_sample_map) return;
+    unsigned cap = C_RB_CAP;
+    for (unsigned i = 0; i < cap; ++i) {
+        c_sample_t* cs = &g_c_rb[i];
+        if (cs->depth == 0) continue;
+        char keybuf[4096];
+        size_t kp = 0;
+        /* choose start index (from leaf side): skip frames belonging to our module or vdso/sig trampolines */
+        int start_idx_leaf = 0;
+        for (int d = 0; d < cs->depth; ++d) { /* leaf -> root scan to find first non-internal leaf */
+            Dl_info info;
+            const char* so = NULL;
+            const char* name = NULL;
+            if (dladdr((void*)cs->pcs[d], &info)) {
+                so = info.dli_fname;
+                name = info.dli_sname;
+            }
+            const char* base = so ? strrchr(so, '/') : NULL;
+            base = base ? base + 1 : so;
+            int is_self = (base && g_self_module[0] && strcmp(base, g_self_module) == 0);
+            int is_vdso = (base && strstr(base, "linux-vdso") != NULL);
+            int is_sigret = (name && (strstr(name, "__restore_rt") || strstr(name, "rt_sigreturn")));
+            if (!(is_self || is_vdso || is_sigret)) {
+                start_idx_leaf = d;
+                break;
+            }
+        }
+        /* build root->leaf order for FlameGraph (reverse from depth-1 down to start_idx_leaf) */
+        for (int d = cs->depth - 1; d >= start_idx_leaf; --d) {
+            Dl_info info;
+            const char* name = NULL;
+            const char* so = NULL;
+            if (dladdr((void*)cs->pcs[d], &info)) {
+                if (info.dli_sname && info.dli_sname[0]) name = info.dli_sname;
+                if (info.dli_fname && info.dli_fname[0]) so = info.dli_fname;
+            }
+            /* build display name */
+            char namebuf[384];
+            if (name && name[0]) {
+                /* module!symbol+offset */
+                uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
+                uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : 0;
+                const char* modbase = so ? (strrchr(so, '/') ? strrchr(so, '/') + 1 : so) : "unknown";
+                snprintf(namebuf, sizeof(namebuf), "%s!%s+0x%lx", modbase, name, (unsigned long)off);
+            } else if (so && so[0]) {
+                /* basename(so)+offset */
+                const char* base = strrchr(so, '/');
+                base = base ? base + 1 : so;
+                uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
+                uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : (uintptr_t)cs->pcs[d];
+                snprintf(namebuf, sizeof(namebuf), "%s+0x%lx", base, (unsigned long)off);
+            } else {
+                char hex[2 + sizeof(uintptr_t) * 2 + 1];
+                size_t hn = _hex_ptr(cs->pcs[d], hex);
+                hex[hn] = '\0';
+                snprintf(namebuf, sizeof(namebuf), "%s", hex);
+            }
+            size_t nlen = strlen(namebuf);
+            if (kp + nlen + 1 >= sizeof(keybuf)) break;
+            if (kp > 0) keybuf[kp++] = ';';
+            memcpy(keybuf + kp, namebuf, nlen);
+            kp += nlen;
+        }
+        keybuf[kp] = '\0';
+        if (kp > 0) {
+            uint64_t* cnt = (uint64_t*)smap_get(context->c_sample_map, keybuf);
+            if (!cnt) {
+                char* keydup = pstrdup(keybuf);
+                cnt = (uint64_t*)pmalloc(sizeof(uint64_t));
+                *cnt = 0;
+                smap_set(context->c_sample_map, keydup, cnt);
+            }
+            (*cnt)++;
+        }
+        /* do not clear here; allow other consumers (e.g. raw writer) to read; clear once after both done */
+    }
+}
+
+static void write_c_samples_file(struct profile_context* context, const char* path) {
+    if (!context || !context->c_sample_map || !path) return;
+    FILE* fp = fopen(path, "w");
+    if (!fp) return;
+    smap_iterate(context->c_sample_map, _cmap_write_cb, fp);
+    fclose(fp);
+}
+
+static void push_lua_folded_samples(lua_State* L, struct profile_context* context) {
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    struct fg_dump_ctx fctx = { .buf = &b, .symbol_map = context->symbol_map };
+    smap_iterate(context->sample_map, _fg_dump_cb, &fctx);
+    luaL_pushresult(&b);
+}
+
+static void write_c_samples_raw(const char* path) {
+    if (!path) return;
+    FILE* fp = fopen(path, "w");
+    if (!fp) return;
+    unsigned cap = C_RB_CAP;
+    for (unsigned i = 0; i < cap; ++i) {
+        c_sample_t* cs = &g_c_rb[i];
+        if (cs->depth == 0) continue;
+        size_t written = 0;
+        /* raw output: module!0xoffset chain in root->leaf order */
+        for (int d = cs->depth - 1; d >= 0; --d) {
+            Dl_info info;
+            const char* so = NULL;
+            if (dladdr((void*)cs->pcs[d], &info)) {
+                if (info.dli_fname && info.dli_fname[0]) so = info.dli_fname;
+            }
+            const char* modbase = "unknown";
+            if (so && so[0]) {
+                const char* base = strrchr(so, '/');
+                modbase = base ? base + 1 : so;
+            }
+            uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
+            uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : (uintptr_t)cs->pcs[d];
+            fprintf(fp, "%s!0x%lx", modbase, (unsigned long)off);
+            written++;
+            if (d > 0) fputc(';', fp);
+        }
+        if (written > 0) fputc('\n', fp);
+    }
+    fclose(fp);
+}
+
+/* gperftools legacy cpuprofile format writer */
+static void write_c_profile_pprof(struct profile_context* context, const char* path) {
+    if (!path) return;
+    FILE* fp = fopen(path, "wb");
+    if (!fp) return;
+
+    /* header: slots of pointer width, native endian */
+    uintptr_t hdr[5];
+    hdr[0] = (uintptr_t)0;         /* header count = 0 */
+    hdr[1] = (uintptr_t)3;         /* header slots after this one = 3 */
+    hdr[2] = (uintptr_t)0;         /* version = 0 */
+    uint64_t period_us64 = 0;
+    int hz = context ? context->cpu_sample_hz : DEFAULT_CPU_cpu_sample_hz;
+    if (hz <= 0) hz = DEFAULT_CPU_cpu_sample_hz;
+    period_us64 = (uint64_t)(1000000ULL / (uint64_t)hz);
+    hdr[3] = (uintptr_t)period_us64; /* sampling period in microseconds */
+    hdr[4] = (uintptr_t)0;         /* padding */
+    fwrite(hdr, sizeof(uintptr_t), 5, fp);
+
+    /* records: for each TLS sample write [count, depth, pcs...] with pcs leaf-first */
+    unsigned cap = C_RB_CAP;
+    for (unsigned i = 0; i < cap; ++i) {
+        c_sample_t* cs = &g_c_rb[i];
+        if (cs->depth == 0) continue;
+        uintptr_t count = (uintptr_t)1;
+        uintptr_t depth = (uintptr_t)cs->depth;
+        fwrite(&count, sizeof(uintptr_t), 1, fp);
+        fwrite(&depth, sizeof(uintptr_t), 1, fp);
+        /* leaf-first as stored: pcs[0]=ip, pcs[1]=caller,... */
+        for (uint16_t d = 0; d < cs->depth; ++d) {
+            uintptr_t pc = (uintptr_t)cs->pcs[d];
+            fwrite(&pc, sizeof(uintptr_t), 1, fp);
+        }
+    }
+
+    /* trailer: 0,1,0 */
+    uintptr_t tr[3];
+    tr[0] = (uintptr_t)0;
+    tr[1] = (uintptr_t)1;
+    tr[2] = (uintptr_t)0;
+    fwrite(tr, sizeof(uintptr_t), 3, fp);
+
+    /* append /proc/self/maps as text */
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (maps) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), maps)) > 0) {
+            fwrite(buf, 1, n, fp);
+        }
+        fclose(maps);
+    }
+
+    fclose(fp);
+}
+
+static void clear_c_tls_samples(void) {
+    unsigned cap = C_RB_CAP;
+    for (unsigned i = 0; i < cap; ++i) {
+        g_c_rb[i].depth = 0;
+    }
+}
+
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -1223,83 +1414,7 @@ _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
         /* fold C stack TLS buffer into c_sample_map using dladdr */
-        if (context->c_sample_map) {
-            unsigned cap = C_RB_CAP;
-            for (unsigned i = 0; i < cap; ++i) {
-                c_sample_t* cs = &g_c_rb[i];
-                if (cs->depth == 0) continue;
-                char keybuf[4096];
-                size_t kp = 0;
-                /* choose start index: skip frames belonging to our module or vdso/sig trampolines */
-                int start_idx = 0;
-                for (int d = 0; d < cs->depth; ++d) {
-                    Dl_info info;
-                    const char* so = NULL;
-                    const char* name = NULL;
-                    if (dladdr((void*)cs->pcs[d], &info)) {
-                        so = info.dli_fname;
-                        name = info.dli_sname;
-                    }
-                    const char* base = so ? strrchr(so, '/') : NULL;
-                    base = base ? base + 1 : so;
-                    int is_self = (base && g_self_module[0] && strcmp(base, g_self_module) == 0);
-                    int is_vdso = (base && strstr(base, "linux-vdso") != NULL);
-                    int is_sigret = (name && (strstr(name, "__restore_rt") || strstr(name, "rt_sigreturn")));
-                    if (!(is_self || is_vdso || is_sigret)) {
-                        start_idx = d;
-                        break;
-                    }
-                }
-                for (int d = start_idx; d < cs->depth; ++d) {
-                    Dl_info info;
-                    const char* name = NULL;
-                    const char* so = NULL;
-                    if (dladdr((void*)cs->pcs[d], &info)) {
-                        if (info.dli_sname && info.dli_sname[0]) name = info.dli_sname;
-                        if (info.dli_fname && info.dli_fname[0]) so = info.dli_fname;
-                    }
-                    /* build display name */
-                    char namebuf[384];
-                    if (name && name[0]) {
-                        /* module!symbol+offset */
-                        uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
-                        uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : 0;
-                        const char* modbase = so ? (strrchr(so, '/') ? strrchr(so, '/') + 1 : so) : "unknown";
-                        snprintf(namebuf, sizeof(namebuf), "%s!%s+0x%lx", modbase, name, (unsigned long)off);
-                    } else if (so && so[0]) {
-                        /* basename(so)+offset */
-                        const char* base = strrchr(so, '/');
-                        base = base ? base + 1 : so;
-                        uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
-                        uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : (uintptr_t)cs->pcs[d];
-                        snprintf(namebuf, sizeof(namebuf), "%s+0x%lx", base, (unsigned long)off);
-                    } else {
-                        char hex[2 + sizeof(uintptr_t) * 2 + 1];
-                        size_t hn = _hex_ptr(cs->pcs[d], hex);
-                        hex[hn] = '\0';
-                        snprintf(namebuf, sizeof(namebuf), "%s", hex);
-                    }
-                    size_t nlen = strlen(namebuf);
-                    if (kp + nlen + 1 >= sizeof(keybuf)) break;
-                    if (kp > 0) keybuf[kp++] = ';';
-                    memcpy(keybuf + kp, namebuf, nlen);
-                    kp += nlen;
-                }
-                keybuf[kp] = '\0';
-                if (kp > 0) {
-                    uint64_t* cnt = (uint64_t*)smap_get(context->c_sample_map, keybuf);
-                    if (!cnt) {
-                        char* keydup = pstrdup(keybuf);
-                        cnt = (uint64_t*)pmalloc(sizeof(uint64_t));
-                        *cnt = 0;
-                        smap_set(context->c_sample_map, keydup, cnt);
-                    }
-                    (*cnt)++;
-                }
-                /* clear entry for next round */
-                cs->depth = 0;
-            }
-        }
+        fold_c_tls_samples(context);
         // full gc
         lua_gc(L, LUA_GCCOLLECT, 0);
 
@@ -1312,20 +1427,16 @@ _ldump(lua_State* L) {
         lua_pushinteger(L, profile_time);
 
         if (context->cpu_mode == MODE_SAMPLE) {
-            // dump folded stacks in FlameGraph format (lines of: path1;path2 count)
-            luaL_Buffer b;
-            luaL_buffinit(L, &b);
-            struct fg_dump_ctx fctx = { .buf = &b, .symbol_map = context->symbol_map };
-            smap_iterate(context->sample_map, _fg_dump_cb, &fctx);
-            luaL_pushresult(&b);
+            /* dump Lua folded stacks */
+            push_lua_folded_samples(L, context);
             /* also write C stacks (names already resolved in keys) to a file */
-            {
-                FILE* fp = fopen("cpu-c-samples.txt", "w");
-                if (fp) {
-                    smap_iterate(context->c_sample_map, _cmap_write_cb, fp);
-                    fclose(fp);
-                }
-            }
+            write_c_samples_file(context, "cpu-c-samples.txt");
+            /* and emit raw addresses for offline symbolization */
+            write_c_samples_raw("cpu-c-samples.raw");
+            /* and emit legacy pprof file for pprof toolchain */
+            write_c_profile_pprof(context, "cpu-c-profile.pprof");
+            /* now it's safe to clear TLS buffer once */
+            clear_c_tls_samples();
         } else {
             // tracing dump
             if (context->callpath) {
@@ -1414,7 +1525,8 @@ static void record_lua_sample_weight(lua_State* L, unsigned int weight) {
                 continue; /* 缓存已有人类可读的函数名，跳过 */
             }
             if (!lua_getstack(L, lvl, &ar)) break;
-            if (lua_getinfo(L, "n", &ar), ar.name && ar.name[0]) {
+            int ok = lua_getinfo(L, "n", &ar);
+            if (ok && ar.name && ar.name[0]) {
                 if (!si) {
                     si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
                     si->source = pstrdup("unknown");

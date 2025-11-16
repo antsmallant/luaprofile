@@ -12,3 +12,8 @@ cpu-samples.txt
 cpu-samples.svg
 profile_result.txt
 cpu-c-samples.txt
+cpu-c-profile.pprof
+cpu-c-samples-c.svg
+cpu-c-samples-pprof.svg
+cpu-c-samples.offline.txt
+cpu-c-samples.raw
