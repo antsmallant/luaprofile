@@ -14,6 +14,7 @@ rm -f cpu-c-samples.txt cpu-c-samples.raw cpu-c-samples.offline.txt cpu-c-sample
 "$LUA_BIN" example_sample.lua
 
 # Lua 栈火焰图
+echo "$FLAME cpu-samples.txt > cpu-samples.svg"
 "$FLAME" cpu-samples.txt > cpu-samples.svg
 
 # C 栈离线符号化（addr2line），生成 cpu-c-samples.offline.txt（folded）与 svg
@@ -77,5 +78,6 @@ fi
 
 # pprof（legacy）生成 C 栈火焰图（若可用）
 if [[ -f cpu-c-profile.pprof ]]; then
+    echo "pprof -svg $LUA_BIN cpu-c-profile.pprof > cpu-c-samples-pprof.svg"
     ./tools/pprof -svg "$LUA_BIN" cpu-c-profile.pprof > cpu-c-samples-pprof.svg
 fi

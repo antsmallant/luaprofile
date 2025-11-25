@@ -37,6 +37,9 @@ generate svg:
 ~/FlameGraph/flamegraph.pl /tmp/folded.txt > /tmp/flame.svg && xdg-open /tmp/flame.svg
 ```
 
+doc:
+https://github.com/google/pprof/blob/main/doc/README.md#pprof     
+
 2. website
 
 https://www.speedscope.app/

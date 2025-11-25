@@ -49,7 +49,7 @@ node1
 #define MODE_PROFILE                1
 #define MODE_SAMPLE                 2
 
-#define DEFAULT_CPU_cpu_sample_hz       250
+#define DEFAULT_CPU_SAMPLE_HZ       250
 
 static char profile_context_key = 'x';
 
@@ -243,7 +243,7 @@ read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_cpu_sample
     if (!out_cpu_mode || !out_mem_mode || !out_cpu_sample_hz) return false;
     *out_cpu_mode = MODE_PROFILE;
     *out_mem_mode = MODE_PROFILE;
-    *out_cpu_sample_hz = DEFAULT_CPU_cpu_sample_hz;
+    *out_cpu_sample_hz = DEFAULT_CPU_SAMPLE_HZ;
     if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
 
     lua_getfield(L, 1, "cpu");
@@ -616,8 +616,8 @@ static void write_c_profile_pprof(struct profile_context* context, const char* p
     hdr[1] = (uintptr_t)3;         /* header slots after this one = 3 */
     hdr[2] = (uintptr_t)0;         /* version = 0 */
     uint64_t period_us64 = 0;
-    int hz = context ? context->cpu_sample_hz : DEFAULT_CPU_cpu_sample_hz;
-    if (hz <= 0) hz = DEFAULT_CPU_cpu_sample_hz;
+    int hz = context ? context->cpu_sample_hz : DEFAULT_CPU_SAMPLE_HZ;
+    if (hz <= 0) hz = DEFAULT_CPU_SAMPLE_HZ;
     period_us64 = (uint64_t)(1000000ULL / (uint64_t)hz);
     hdr[3] = (uintptr_t)period_us64; /* sampling period in microseconds */
     hdr[4] = (uintptr_t)0;         /* padding */
@@ -685,7 +685,7 @@ profile_create() {
     context->last_alloc_ud = NULL;
     context->cpu_mode = MODE_PROFILE;       // default: profile
     context->mem_mode = MODE_PROFILE;       // default: profile
-    context->cpu_sample_hz = DEFAULT_CPU_cpu_sample_hz; // default: hz for sample
+    context->cpu_sample_hz = DEFAULT_CPU_SAMPLE_HZ; // default: hz for sample
     context->rng_state = 0;
     context->profile_cost_ns = 0;
     return context;
@@ -1311,7 +1311,7 @@ _lstart(lua_State* L) {
     // parse options: start([opts]), opts is a table
     int cpu_mode = MODE_PROFILE; // default profile
     int mem_mode = MODE_PROFILE; // default profile
-    int cpu_sample_hz = DEFAULT_CPU_cpu_sample_hz;
+    int cpu_sample_hz = DEFAULT_CPU_SAMPLE_HZ;
     bool read_ok = read_arg(L, &cpu_mode, &mem_mode, &cpu_sample_hz);
     if (!read_ok) {
         printf("start fail, invalid options\n");
