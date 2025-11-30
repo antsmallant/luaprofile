@@ -1120,7 +1120,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_checkstack(arg->L, 3);
     lua_newtable(arg->L);
 
-    // 递归获取所有子结点的指标和
+    // 递归获取所有子节点的指标和
     struct dump_call_path_arg child_arg;
     _init_dump_call_path_arg(&child_arg, arg->pcontext, arg->L);
     if (icallpath_children_size(path) > 0) {
@@ -1131,7 +1131,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
 
-    // 本节点的聚合指标=本节点指标+所有子结点的指标
+    // 本节点的聚合指标=本节点指标+所有子节点的指标
     uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
     uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
     uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
