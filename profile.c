@@ -18,7 +18,7 @@
 #include <math.h>
 #include <time.h>
 #include <errno.h>
-#include "luaprof.h"
+#include "lprof.h"
 #include <signal.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -1248,8 +1248,19 @@ get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
     return i;
 }
 
+static int _stop_gc_if_need(lua_State* L) {
+    // stop gc before set hook
+    int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
+    if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
+    return gc_was_running;
+}
+
+static void _restart_gc_if_need(lua_State* L, int gc_was_running) {
+    if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+}
+
 static void
-_hook_all_co(lua_State* L) {
+_set_hook_all_co(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     if (!ctx) {
         printf("hook all co fail, profile not started\n");
@@ -1259,8 +1270,7 @@ _hook_all_co(lua_State* L) {
         return;
     }
     // stop gc before set hook
-    int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
-    if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
+    int gc_was_running = _stop_gc_if_need(L);
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
@@ -1269,11 +1279,11 @@ _hook_all_co(lua_State* L) {
             lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
         }
     }
-    if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+    _restart_gc_if_need(L, gc_was_running);
 }
 
 static void 
-_unhook_all_co(lua_State* L) {
+_unset_hook_all_co(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     if (!ctx) {
         printf("unhook all co fail, profile not started\n");
@@ -1283,15 +1293,14 @@ _unhook_all_co(lua_State* L) {
         return;
     }    
     // stop gc before unset hook
-    int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
-    if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }     
+    int gc_was_running = _stop_gc_if_need(L); 
     lua_State* states[MAX_CO_SIZE] = {0};
     int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
     int i;
     for (i = sz - 1; i >= 0; i--) {
         lua_sethook(states[i], NULL, 0, 0);
     }
-    if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+    _restart_gc_if_need(L, gc_was_running);
 }
 
 static int
@@ -1337,7 +1346,7 @@ _lstart(lua_State* L) {
             printf("start thread timer fail\n");
         }
     } else if (cpu_mode == MODE_PROFILE || mem_mode != MODE_OFF) {
-        _hook_all_co(L);
+        _set_hook_all_co(L);
     }
     
     context->running_in_hook = false;
@@ -1356,7 +1365,7 @@ _lstop(lua_State* L) {
     context->running_in_hook = true;
     context->is_ready = false;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
-    _unhook_all_co(L);
+    _unset_hook_all_co(L);
     unset_profile_context(L);
     profile_free(context);
     context = NULL;
@@ -1413,8 +1422,7 @@ _ldump(lua_State* L) {
         lua_gc(L, LUA_GCCOLLECT, 0);
 
         // stop gc before dump
-        int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
-        if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
+        int gc_was_running = _stop_gc_if_need(L); 
         context->running_in_hook = true;
         uint64_t cur_time = get_mono_ns();
         uint64_t profile_time = cur_time - context->start_time;
@@ -1441,7 +1449,7 @@ _ldump(lua_State* L) {
             }
         }
         context->running_in_hook = false;
-        if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+        _restart_gc_if_need(L, gc_was_running);
         return 2;
     }
     return 0;
