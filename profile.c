@@ -373,7 +373,6 @@ struct dump_call_path_arg {
     struct profile_context* pcontext;
     lua_State* L;
     uint64_t index;
-    uint64_t cpu_samples_sum;
     uint64_t alloc_bytes_sum;
     uint64_t free_bytes_sum;
     uint64_t alloc_times_sum;
@@ -385,7 +384,6 @@ static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct prof
     arg->pcontext = pcontext;
     arg->L = L;
     arg->index = 0;
-    arg->cpu_samples_sum = 0;
     arg->alloc_bytes_sum = 0;
     arg->free_bytes_sum = 0;
     arg->alloc_times_sum = 0;
@@ -1139,14 +1137,13 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
     uint64_t free_times_incl = node->free_times + child_arg.free_times_sum;
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
-    uint64_t cpu_samples_incl = node->cpu_samples + child_arg.cpu_samples_sum;
+
     // 本节点的其他指标
     uint64_t real_cost = node->real_cost;
     uint64_t call_count = node->call_count;
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
-    arg->cpu_samples_sum += cpu_samples_incl;
     arg->alloc_bytes_sum += alloc_bytes_incl;
     arg->free_bytes_sum += free_bytes_incl;
     arg->alloc_times_sum += alloc_times_incl;
@@ -1179,9 +1176,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
         lua_pushstring(arg->L, percent_str);
         lua_setfield(arg->L, -2, "cpu_cost_percent");
 
-    } else if (arg->pcontext->cpu_mode == MODE_SAMPLE) {
-        lua_pushinteger(arg->L, (lua_Integer)cpu_samples_incl);
-        lua_setfield(arg->L, -2, "cpu_samples");
     }
 
     if (arg->pcontext->mem_mode == MODE_PROFILE) {
