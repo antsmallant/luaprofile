@@ -1,5 +1,5 @@
-root="./"
-package.path = package.path .. ";" .. root .. "?.lua"
+root="../"
+package.path = package.path .. ";" .. root .. "?.lua" .. ";" .. root .. "example/?.lua"
 package.cpath = package.cpath .. ";" .. root .. "?.so"
 
 local profile = require "profile"

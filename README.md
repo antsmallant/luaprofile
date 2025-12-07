@@ -9,7 +9,7 @@ cd luaprofile && sh build.sh
 
 ## run the script
 ```
-sh run-example-profile.sh
+cd example && sh run-example-profile.sh
 ```
 
 ## view the result 
