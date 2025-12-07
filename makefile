@@ -3,7 +3,7 @@
 all: linux
 
 linux:
-	gcc -shared -fPIC -Wall -g -O2 -DLUA_PROF_TRAP -fno-omit-frame-pointer \
+	gcc -shared -fPIC -Wall -g -O2 \
 		-I3rd/lua-5.4.8/src \
 		-o luaprofilec.so \
 		profile.c

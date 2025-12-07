@@ -1,4 +1,8 @@
-// This file is modified version from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile
+/*
+This file is modified from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
+And the original version is this : https://github.com/lvzixun/luaprofile .
+
+*/
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -17,18 +21,6 @@
 #include "lauxlib.h"
 
 
-/*
-callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
-
-prototype 相当于一个 lua closure/c closure/c function 在 lua vm 中的唯一指针。它是 callpath node 的 key，一个新的 frame 要找到对应的 callpath node，就用 prototype 从父frame 的 node 里面查找 child node，找不到则创建。  
-
-相同 prototype 的闭包或函数，可能会在 callpath tree 对应多个 node，这取决于它的父亲是谁。   
-
-node1
-  node21
-    node31
-对应着 frame1 -> frame2 -> frame3 的调用关系。 
-*/
 #define prealloc  realloc
 #define pmalloc   malloc
 #define pfree  free
@@ -44,7 +36,7 @@ node1
 #define MODE_PROFILE                1
 #define MODE_SAMPLE                 2
 
-#define DEFAULT_IMAP_SLOT_SIZE  1024
+#define DEFAULT_IMAP_SLOT_SIZE      1024
 
 static char profile_context_key = 'x';
 
