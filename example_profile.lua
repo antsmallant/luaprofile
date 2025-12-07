@@ -4,7 +4,7 @@ package.cpath = package.cpath .. ";" .. root .. "?.so"
 
 local profile = require "profile"
 local json = require "json"
-local c = require "luaprofilec"
+local c = require "luaprofilecore"
 
 -- 带时间戳的打印：[YYYY-MM-DD HH:MM:SS] 后跟原始内容
 local function print_ts(...)

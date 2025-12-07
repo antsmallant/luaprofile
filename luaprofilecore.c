@@ -1204,7 +1204,7 @@ static int _lsleep(lua_State* L) {
 }
 
 int
-luaopen_luaprofilec(lua_State* L) {
+luaopen_luaprofilecore(lua_State* L) {
     luaL_checkversion(L);
      luaL_Reg l[] = {
         {"start", _lstart},
