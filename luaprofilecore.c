@@ -1,8 +1,8 @@
 /*
-Modify from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
-The original version is https://github.com/lvzixun/luaprofile .
+Modify from https://github.com/lsg2020/luaprofile .
+Original version is https://github.com/lvzixun/luaprofile .
 
-Check https://github.com/antsmallant for more.
+Check https://github.com/antsmallant/luaprofile for more.
 */
 
 #include <stdlib.h>
@@ -32,7 +32,6 @@ Check https://github.com/antsmallant for more.
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
-// 模式定义（统一用于 CPU/Memory）
 #define MODE_OFF                    0
 #define MODE_ON                     1
 
