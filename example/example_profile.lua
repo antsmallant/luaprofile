@@ -2,9 +2,8 @@ root="../"
 package.path = package.path .. ";" .. root .. "?.lua" .. ";" .. root .. "example/?.lua"
 package.cpath = package.cpath .. ";" .. root .. "?.so"
 
-local profile = require "profile"
+local lpaux = require "luaprofileaux"
 local json = require "json"
-local c = require "luaprofilecore"
 
 -- 带时间戳的打印：[YYYY-MM-DD HH:MM:SS] 后跟原始内容
 local function print_ts(...)
@@ -86,9 +85,9 @@ local function test_with_profile()
     print_ts("test_with_profile start")
     local resultfile = "./example_result.json"
     local opts = { mem_profile = "off" } -- 控制是否开启内存 profile
-    profile.start(opts)
+    lpaux.start(opts)
     do_test1()
-    local result = profile.stop()
+    local result = lpaux.stop()
     local strResult = json.encode(result)
     write_profile_result(resultfile, strResult)
     print_ts("test_with_profile stop")
