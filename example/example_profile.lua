@@ -16,8 +16,6 @@ local function print_ts(...)
     io.stdout:write("[" .. ts .. "] ", table.concat(parts, "\t"), "\n")
 end
 
-local g_storage = {}
-
 local function write_profile_result(str)
     local file, err = io.open("./example_result.json", "w")
     if not file then
@@ -52,6 +50,8 @@ local function test_vccl()
     end
     return acc
 end
+
+local g_storage = {}
 
 local function test_storage1()
     for i = 1, 100 do
