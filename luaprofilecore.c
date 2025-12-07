@@ -1,6 +1,6 @@
 /*
-Modified from: https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
-The original version is : https://github.com/lvzixun/luaprofile .
+Modified from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
+The original version is https://github.com/lvzixun/luaprofile .
 
 */
 
@@ -281,6 +281,7 @@ get_mono_ns() {
     return sec * (uint64_t)NANOSEC + nsec;
 }
 
+#ifdef GET_REALTIME
 // 获取绝对时间戳（纳秒），会受 NTP 调整。
 // 可以用于获取当前的年月日。
 static inline uint64_t
@@ -291,6 +292,7 @@ get_realtime_ns() {
     uint64_t nsec = (uint64_t)ti.tv_nsec;
     return sec * (uint64_t)NANOSEC + nsec;
 }
+#endif
 
 // 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample" }
 static bool
