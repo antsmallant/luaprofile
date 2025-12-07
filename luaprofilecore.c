@@ -983,50 +983,6 @@ static void _restart_gc_if_need(lua_State* L, int gc_was_running) {
 }
 
 static int
-lmark_all(lua_State* L) {
-    struct profile_context* ctx = get_profile_context(L);
-    if (!ctx) {
-        printf("mark all co fail, profile not started\n");
-        lua_pushboolean(L, false);
-        lua_pushstring(L, "profile not started");
-        return 2;
-    }
-
-    int gc_was_running = _stop_gc_if_need(L);
-
-    lua_State* states[MAX_CO_SIZE] = {0};
-    int i = get_all_coroutines(L, states, MAX_CO_SIZE);
-    for (i = i - 1; i >= 0; i--) {
-        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
-    }
-    _restart_gc_if_need(L, gc_was_running);
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int 
-lunmark_all(lua_State* L) {
-    struct profile_context* ctx = get_profile_context(L);
-    if (!ctx) {
-        printf("unhook all co fail, profile not started\n");
-        lua_pushboolean(L, false);
-        lua_pushstring(L, "profile not started");
-        return 2;
-    }
-    // stop gc before unset hook
-    int gc_was_running = _stop_gc_if_need(L); 
-    lua_State* states[MAX_CO_SIZE] = {0};
-    int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
-    int i;
-    for (i = sz - 1; i >= 0; i--) {
-        lua_sethook(states[i], NULL, 0, 0);
-    }
-    _restart_gc_if_need(L, gc_was_running);
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int
 lstart(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context != NULL) {
@@ -1110,6 +1066,50 @@ lunmark(lua_State* L) {
     }
     lua_sethook(co, NULL, 0, 0);
     return 0;
+}
+
+static int
+lmark_all(lua_State* L) {
+    struct profile_context* ctx = get_profile_context(L);
+    if (!ctx) {
+        printf("mark all co fail, profile not started\n");
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "profile not started");
+        return 2;
+    }
+
+    int gc_was_running = _stop_gc_if_need(L);
+
+    lua_State* states[MAX_CO_SIZE] = {0};
+    int i = get_all_coroutines(L, states, MAX_CO_SIZE);
+    for (i = i - 1; i >= 0; i--) {
+        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
+    }
+    _restart_gc_if_need(L, gc_was_running);
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int 
+lunmark_all(lua_State* L) {
+    struct profile_context* ctx = get_profile_context(L);
+    if (!ctx) {
+        printf("unhook all co fail, profile not started\n");
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "profile not started");
+        return 2;
+    }
+    // stop gc before unset hook
+    int gc_was_running = _stop_gc_if_need(L); 
+    lua_State* states[MAX_CO_SIZE] = {0};
+    int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
+    int i;
+    for (i = sz - 1; i >= 0; i--) {
+        lua_sethook(states[i], NULL, 0, 0);
+    }
+    _restart_gc_if_need(L, gc_was_running);
+    lua_pushboolean(L, true);
+    return 1;
 }
 
 static int
