@@ -1,7 +1,8 @@
 /*
-Modified from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
+Modify from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
 The original version is https://github.com/lvzixun/luaprofile .
 
+Check https://github.com/antsmallant for more.
 */
 
 #include <stdlib.h>
@@ -23,8 +24,8 @@ The original version is https://github.com/lvzixun/luaprofile .
 
 #define prealloc  realloc
 #define pmalloc   malloc
-#define pfree  free
-#define pcalloc calloc
+#define pfree     free
+#define pcalloc   calloc
 
 #define MAX_CALL_SIZE               1024
 #define MAX_CO_SIZE                 1024
@@ -33,8 +34,7 @@ The original version is https://github.com/lvzixun/luaprofile .
 
 // 模式定义（统一用于 CPU/Memory）
 #define MODE_OFF                    0
-#define MODE_PROFILE                1
-#define MODE_SAMPLE                 2
+#define MODE_ON                     1
 
 #define DEFAULT_IMAP_SLOT_SIZE      1024
 
@@ -294,20 +294,17 @@ get_realtime_ns() {
 }
 #endif
 
-// 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample" }
+// 读取启动参数：{ cpu = "off|on", mem = "off|on" }
 static bool
 read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode) {
     if (!out_cpu_mode || !out_mem_mode) return false;
-    *out_cpu_mode = MODE_PROFILE;
-    *out_mem_mode = MODE_PROFILE;
     if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
 
     lua_getfield(L, 1, "cpu");
     if (lua_isstring(L, -1)) {
         const char* s = lua_tostring(L, -1);
         if (strcmp(s, "off") == 0) *out_cpu_mode = MODE_OFF;
-        else if (strcmp(s, "profile") == 0) *out_cpu_mode = MODE_PROFILE;
-        else if (strcmp(s, "sample") == 0) *out_cpu_mode = MODE_SAMPLE;
+        else if (strcmp(s, "on") == 0) *out_cpu_mode = MODE_ON;
         else {printf("invalid cpu mode: %s\n", s); return false;}
     }
     lua_pop(L, 1);
@@ -316,8 +313,7 @@ read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode) {
     if (lua_isstring(L, -1)) {
         const char* s = lua_tostring(L, -1);
         if (strcmp(s, "off") == 0) *out_mem_mode = MODE_OFF;
-        else if (strcmp(s, "profile") == 0) *out_mem_mode = MODE_PROFILE;
-        else if (strcmp(s, "sample") == 0) *out_mem_mode = MODE_SAMPLE;
+        else if (strcmp(s, "on") == 0) *out_mem_mode = MODE_ON;
         else {printf("invalid mem mode: %s\n", s); return false;}
     }
     lua_pop(L, 1);
@@ -466,8 +462,8 @@ profile_create() {
     context->running_in_hook = false;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
-    context->cpu_mode = MODE_PROFILE;       // default: profile
-    context->mem_mode = MODE_PROFILE;       // default: profile
+    context->cpu_mode = MODE_ON;
+    context->mem_mode = MODE_ON;
     context->profile_cost_ns = 0;
     return context;
 }
@@ -656,33 +652,23 @@ static inline struct callpath_node* _current_leaf_node(struct profile_context* c
 会导致同一层的这类函数被合并为同一个节点，比如下面的代码，最终 print 会错误的合并到 tonumber 的节点中，显示为
 2 次 tonumber 调用。 
 
-验证代码:
 local function test1()
-    local profile = require "profile"
-    local json = require "cjson"
-    profile.start()
     tonumber("123")    
     print("111")
-    local result = profile.stop()
-    skynet.error("test1:", json.encode(result))
 end
-test1()
-
-结果可用 https://jsongrid.com/ 查看
 */
 static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
     const void* proto = NULL;
     if (ar->i_ci && ar->i_ci->func.p) {
         const TValue* tv = s2v(ar->i_ci->func.p);
         if (ttislcf(tv)) {
-            // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
-            proto = (const void*)fvalue(tv);
+            proto = (const void*)fvalue(tv);   // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
         } else if (ttisclosure(tv)) {
             const Closure* cl = clvalue(tv);
             if (cl->c.tt == LUA_VLCL) {
-                proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
+                proto = (const void*)cl->l.p;  // LUA_VLCL：Lua 闭包
             } else if (cl->c.tt == LUA_VCCL) {
-                proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
+                proto = (const void*)cl->c.f;  // LUA_VCCL：C 闭包
             }
         }
     }
@@ -912,7 +898,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, node->last_ret_time);
     lua_setfield(arg->L, -2, "last_ret_time");
 
-    if (arg->pcontext->cpu_mode == MODE_PROFILE) {
+    if (arg->pcontext->cpu_mode == MODE_ON) {
         lua_pushinteger(arg->L, call_count);
         lua_setfield(arg->L, -2, "call_count");
 
@@ -928,10 +914,9 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
         snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
         lua_pushstring(arg->L, percent_str);
         lua_setfield(arg->L, -2, "cpu_cost_percent");
-
     }
 
-    if (arg->pcontext->mem_mode == MODE_PROFILE) {
+    if (arg->pcontext->mem_mode == MODE_ON) {
         lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
         lua_setfield(arg->L, -2, "alloc_bytes");
 
@@ -1012,39 +997,37 @@ static void _restart_gc_if_need(lua_State* L, int gc_was_running) {
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
 }
 
-static void
-_set_hook_all_co(lua_State* L) {
+static int
+_lmark_all(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     if (!ctx) {
-        printf("hook all co fail, profile not started\n");
-        return;
+        printf("mark all co fail, profile not started\n");
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "profile not started");
+        return 2;
     }
-    if (ctx->cpu_mode == MODE_OFF) {
-        return;
-    }
-    // stop gc before set hook
+
     int gc_was_running = _stop_gc_if_need(L);
+
     lua_State* states[MAX_CO_SIZE] = {0};
     int i = get_all_coroutines(L, states, MAX_CO_SIZE);
     for (i = i - 1; i >= 0; i--) {
-        if (ctx && ctx->cpu_mode == MODE_PROFILE) {
-            // profiling (full call/ret)
-            lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
-        }
+        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
     }
     _restart_gc_if_need(L, gc_was_running);
+    lua_pushboolean(L, true);
+    return 1;
 }
 
-static void 
-_unset_hook_all_co(lua_State* L) {
+static int 
+_lunmark_all(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     if (!ctx) {
         printf("unhook all co fail, profile not started\n");
-        return;
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "profile not started");
+        return 2;
     }
-    if (ctx->cpu_mode == MODE_OFF) {
-        return;
-    }    
     // stop gc before unset hook
     int gc_was_running = _stop_gc_if_need(L); 
     lua_State* states[MAX_CO_SIZE] = {0};
@@ -1054,6 +1037,8 @@ _unset_hook_all_co(lua_State* L) {
         lua_sethook(states[i], NULL, 0, 0);
     }
     _restart_gc_if_need(L, gc_was_running);
+    lua_pushboolean(L, true);
+    return 1;
 }
 
 static int
@@ -1065,15 +1050,16 @@ _lstart(lua_State* L) {
     }
 
     // parse options: start([opts]), opts is a table
-    int cpu_mode = MODE_PROFILE; // default profile
-    int mem_mode = MODE_PROFILE; // default profile
+    int cpu_mode = MODE_ON;  // default 
+    int mem_mode = MODE_ON;  // default
     bool read_ok = read_arg(L, &cpu_mode, &mem_mode);
     if (!read_ok) {
         printf("start fail, invalid options\n");
         return 0;
     }
 
-    lua_gc(L, LUA_GCCOLLECT, 0);  // full gc
+    // full gc before start
+    lua_gc(L, LUA_GCCOLLECT, 0);  
 
     context = profile_create();
     context->running_in_hook = true;
@@ -1082,12 +1068,10 @@ _lstart(lua_State* L) {
     context->cpu_mode = cpu_mode;
     context->mem_mode = mem_mode;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    if (mem_mode != MODE_OFF) {
+    if (MODE_ON == mem_mode) {
         lua_setallocf(L, _hook_alloc, context);
     }
     set_profile_context(L, context);
-
-    _set_hook_all_co(L);
     
     context->running_in_hook = false;
     printf("luaprofile started, cpu_mode = %d, mem_mode = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->last_alloc_ud);    
@@ -1101,11 +1085,10 @@ _lstop(lua_State* L) {
         printf("stop fail, profile not started\n");
         return 0;
     }
-    
+
     context->running_in_hook = true;
     context->is_ready = false;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
-    _unset_hook_all_co(L);
     unset_profile_context(L);
     profile_free(context);
     context = NULL;
@@ -1150,7 +1133,7 @@ static int
 _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
-        // full gc
+        // full gc to free objects, make mem profile more accurate
         lua_gc(L, LUA_GCCOLLECT, 0);
 
         // stop gc before dump
@@ -1213,6 +1196,8 @@ luaopen_luaprofilecore(lua_State* L) {
         {"stop", _lstop},
         {"mark", _lmark},
         {"unmark", _lunmark},
+        {"mark_all", _lmark_all},
+        {"unmark_all", _lunmark_all},
         {"dump", _ldump},
         {"getnanosec", _lget_mono_ns},
         {"sleep", _lsleep},

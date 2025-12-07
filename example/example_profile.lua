@@ -17,13 +17,15 @@ local function print_ts(...)
 end
 
 local function write_profile_result(str)
-    local file, err = io.open("./example_result.json", "w")
+    local fp = "./example_result.json"
+    local file, err = io.open(fp, "w")
     if not file then
         io.stderr:write("open file failed: " .. tostring(err) .. "\n")
         return false
     end
     file:write(str, "\n")
     file:close()
+    print_ts("write profile result to " .. fp)
     return true
 end
 
@@ -81,37 +83,15 @@ local function do_test1()
     test_vccl()    
 end
 
-local function test_11()
-    local t = {}
-    for i = 1, 100000 do
-        table.insert(t, i)
-    end
-    return t
-end
-
-local function test_12()
-    local t = {}
-    for i = 1, 100000 do
-        table.insert(t, i)
-    end
-    return t
-end
-
-local function do_test()
-    test_11()
-    test_12()
-end
-
 local function test_with_profile()
     print_ts("test_with_profile start")
-    local opts = { cpu = "profile", mem = "profile" }
+    local opts = { mem = "on" } -- 控制是否开启内存 profile
     profile.start(opts)
     local t1 = c.getnanosec()
-    do_test()
+    do_test1()
     local t2 = c.getnanosec()
     local result = profile.stop()
     local strResult = json.encode(result)
-    print(strResult)
     write_profile_result(strResult)
     print_ts("test_with_profile stop")
     return t2 - t1
