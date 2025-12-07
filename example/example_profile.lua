@@ -19,7 +19,7 @@ end
 local g_storage = {}
 
 local function write_profile_result(str)
-    local file, err = io.open(root .. "example_result.json", "w")
+    local file, err = io.open("./example_result.json", "w")
     if not file then
         io.stderr:write("open file failed: " .. tostring(err) .. "\n")
         return false

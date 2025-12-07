@@ -6,4 +6,4 @@
 .cursor/
 
 compile_commands.json
-example_result.json
+example/example_result.json
