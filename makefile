@@ -4,9 +4,9 @@ all: linux
 
 linux:
 	gcc -shared -fPIC -Wall -g -O2 \
-		-Ibuild/lua-5.4.8/src \
-		-o luaprofilec.so \
-		imap.c profile.c icallpath.c
+		-I3rd/lua-5.4.8/src \
+		-o luaprofilecore.so \
+		luaprofilecore.c
 
 clean:
-	rm -rf luaprofilec.so
+	rm -rf luaprofilecore.so

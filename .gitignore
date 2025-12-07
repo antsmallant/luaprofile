@@ -1,11 +1,9 @@
 *.so
 *.s
-test_imap
-test_imap.c
-old_profile.lua
 *.out
-test.lua
 *.dSYM
-build/
 .cache/
+.cursor/
+
 compile_commands.json
+example/example_result.json

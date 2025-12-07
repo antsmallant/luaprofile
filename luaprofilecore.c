@@ -1,52 +1,315 @@
-// This file is modified version from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile
+/*
+Modify from https://github.com/lsg2020/luaprofile .
+Original version is https://github.com/lvzixun/luaprofile .
 
-#include "profile.h"
-#include "imap.h"
-#include "icallpath.h"
+Check https://github.com/antsmallant/luaprofile for more.
+*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <time.h> 
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <errno.h>
 #include "lobject.h"
+#include "lfunc.h"
 #include "lstate.h"
 #include "lua.h"
-#include <pthread.h>
-#include <stdint.h>
-#include <string.h>
+#include "lauxlib.h"
 
-/*
-callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
 
-prototype 相当于一个 lua closure/c closure/c function 在 lua vm 中的唯一指针。它是 callpath node 的 key，一个新的 frame 要找到对应的 callpath node，就用 prototype 从父frame 的 node 里面查找 child node，找不到则创建。  
-
-相同 prototype 的闭包或函数，可能会在 callpath tree 对应多个 node，这取决于它的父亲是谁。   
-
-node1
-  node21
-    node31
-对应着 frame1 -> frame2 -> frame3 的调用关系。 
-*/
+#define prealloc  realloc
+#define pmalloc   malloc
+#define pfree     free
+#define pcalloc   calloc
 
 #define MAX_CALL_SIZE               1024
 #define MAX_CO_SIZE                 1024
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
+#define MODE_OFF                    0
+#define MODE_ON                     1
+
+#define DEFAULT_IMAP_SLOT_SIZE      1024
+
 static char profile_context_key = 'x';
 
+struct icallpath_context {
+    uint64_t key;
+    void* value;
+    struct imap_context* children;
+};
+
+enum imap_status {
+    IS_NONE,
+    IS_EXIST,
+    IS_REMOVE,
+};
+
+struct imap_slot {
+    uint64_t key;
+    void* value;
+    enum imap_status status;
+    struct imap_slot* next;
+};
+
+struct imap_context {
+    struct imap_slot* slots;
+    size_t size;
+    size_t count;
+    struct imap_slot* lastfree;
+};
+
+typedef void(*observer)(uint64_t key, void* value, void* ud);
+static void imap_set(struct imap_context* imap, uint64_t key, void* value);
+static void icallpath_free(struct icallpath_context* icallpath);
+
+static struct imap_context *
+imap_create(void) {
+    struct imap_context* imap = (struct imap_context*)pmalloc(sizeof(*imap));
+    imap->slots = (struct imap_slot*)pcalloc(DEFAULT_IMAP_SLOT_SIZE, sizeof(struct imap_slot));
+    imap->size = DEFAULT_IMAP_SLOT_SIZE;
+    imap->count = 0;
+    imap->lastfree = imap->slots + imap->size;
+    return imap;
+}
+
+static void
+imap_free(struct imap_context* imap) {
+    pfree(imap->slots);
+    pfree(imap);
+}
+
 static inline uint64_t
-gettime() {
+_imap_hash(struct imap_context* imap, uint64_t key) {
+    uint64_t hash = key % (uint64_t)(imap->size);
+    return hash;
+}
+
+static void
+_imap_rehash(struct imap_context* imap) {
+    size_t new_sz = DEFAULT_IMAP_SLOT_SIZE;
+    struct imap_slot* old_slots = imap->slots;
+    size_t old_count = imap->count;
+    size_t old_size = imap->size;
+    while(new_sz <= imap->count) {
+        new_sz *= 2;
+    }
+
+    struct imap_slot* new_slots = (struct imap_slot*)pcalloc(new_sz, sizeof(struct imap_slot));
+    imap->lastfree = new_slots + new_sz;
+    imap->size = new_sz;
+    imap->slots = new_slots;
+    imap->count = 0;
+
+    size_t i=0;
+    for(i=0; i<old_size; i++) {
+        struct imap_slot* p = &(old_slots[i]);
+        enum imap_status status = p->status;
+        if(status == IS_EXIST) {
+            imap_set(imap, p->key, p->value);
+        }
+    }
+
+    assert(old_count == imap->count);
+    pfree(old_slots);
+}
+
+static struct imap_slot *
+_imap_query(struct imap_context* imap, uint64_t key) {
+    uint64_t hash = _imap_hash(imap, key);
+    struct imap_slot* p = &(imap->slots[hash]);
+    if(p->status != IS_NONE) {
+        while(p) {
+            if(p->key == key && p->status == IS_EXIST) {
+                return p;
+            }
+            p = p->next;
+        }
+    }
+    return NULL;
+}
+
+static void *
+imap_query(struct imap_context* imap, uint64_t key) {
+    struct imap_slot* p = _imap_query(imap, key);
+    if(p) {
+        return p->value;
+    }
+    return NULL;
+}
+
+static struct imap_slot *
+_imap_getfree(struct imap_context* imap) {
+    while(imap->lastfree > imap->slots) {
+        imap->lastfree--;
+        if(imap->lastfree->status == IS_NONE) {
+            return imap->lastfree;
+        }
+    }
+    return NULL;
+}
+
+static void
+imap_set(struct imap_context* imap, uint64_t key, void* value) {
+    assert(value);
+    uint64_t hash = _imap_hash(imap, key);
+    struct imap_slot* p = &(imap->slots[hash]);
+    if(p->status == IS_EXIST) {
+        struct imap_slot* np = p;
+        while(np) {
+            if(np->key == key && np->status == IS_EXIST) {
+                np->value = value;
+                return;
+            }
+            np = np->next;
+        }
+
+        np = _imap_getfree(imap);
+        if(np == NULL) {
+            _imap_rehash(imap);
+            imap_set(imap, key, value);
+            return;
+        }
+
+        uint64_t main_hash = _imap_hash(imap, p->key);
+        np->next = p->next;
+        p->next = np;
+        if(main_hash == hash) {
+            p = np;
+        }else {
+            np->key = p->key;
+            np->value = p->value;
+            np->status = IS_EXIST;
+        }
+    }
+
+    imap->count++;
+    p->status = IS_EXIST;
+    p->key = key;
+    p->value = value;
+}
+
+static void *
+imap_remove(struct imap_context* imap, uint64_t key) {
+    struct imap_slot* p = _imap_query(imap, key);
+    if(p) {
+        imap->count--;
+        p->status = IS_REMOVE;
+        return p->value;
+    }
+    return NULL;
+}
+
+static void
+imap_dump(struct imap_context* imap, observer observer_cb, void* ud) {
+    size_t i=0;
+    for(i=0; i<imap->size; i++) {
+        struct imap_slot* v = &imap->slots[i];
+        if(v->status == IS_EXIST) {
+            observer_cb(v->key, v->value, ud);
+        }
+    }
+}
+
+static size_t
+imap_size(struct imap_context* imap) {
+    return imap->count;
+}
+
+static struct icallpath_context* icallpath_create(uint64_t key, void* value) {
+    struct icallpath_context* icallpath = (struct icallpath_context*)pmalloc(sizeof(*icallpath));
+    icallpath->key = key;
+    icallpath->value = value;
+    icallpath->children = imap_create();
+
+    return icallpath;
+}
+
+static void icallpath_free_child(uint64_t key, void* value, void* ud) {
+    icallpath_free((struct icallpath_context*)value);
+}
+
+static void icallpath_free(struct icallpath_context* icallpath) {
+    if (icallpath->value) {
+        pfree(icallpath->value);
+        icallpath->value = NULL;
+    }
+    imap_dump(icallpath->children, icallpath_free_child, NULL);
+    imap_free(icallpath->children);
+    pfree(icallpath);
+}
+
+static struct icallpath_context* icallpath_get_child(struct icallpath_context* icallpath, uint64_t key) {
+    void* child_path = imap_query(icallpath->children, key);
+    return (struct icallpath_context*)child_path;
+}
+
+static struct icallpath_context* icallpath_add_child(struct icallpath_context* icallpath, uint64_t key, void* value) {
+    struct icallpath_context* child_path = icallpath_create(key, value);
+    imap_set(icallpath->children, key, child_path);
+    return child_path;
+}
+
+static void* icallpath_getvalue(struct icallpath_context* icallpath) {
+    return icallpath->value;
+}
+
+static void icallpath_dump_children(struct icallpath_context* icallpath, observer observer_cb, void* ud) {
+    imap_dump(icallpath->children, observer_cb, ud);
+}
+
+static size_t icallpath_children_size(struct icallpath_context* icallpath) {
+    return imap_size(icallpath->children);
+}
+
+// 获取单调递增的时间戳（纳秒），不会被 NTP 调整。
+// 只用于计算时间差，不能当成绝对时间戳用于获取当前的年月日。
+// 如果需要获取绝对时间戳，请使用 get_realtime_ns。    
+static inline uint64_t
+get_mono_ns() {
     struct timespec ti;
-    clock_gettime(CLOCK_REALTIME, &ti);  // would be faster
-    long sec = ti.tv_sec & 0xffff;
-    long nsec = ti.tv_nsec;
-    return sec * NANOSEC + nsec;
+    clock_gettime(CLOCK_MONOTONIC, &ti);
+    uint64_t sec = (uint64_t)ti.tv_sec;
+    uint64_t nsec = (uint64_t)ti.tv_nsec;
+    return sec * (uint64_t)NANOSEC + nsec;
 }
 
-static inline double
-realtime_sec(uint64_t t) {
-    return (double)t / NANOSEC;
+#ifdef GET_REALTIME
+// 获取绝对时间戳（纳秒），会受 NTP 调整。
+// 可以用于获取当前的年月日。
+static inline uint64_t
+get_realtime_ns() {
+    struct timespec ti;
+    clock_gettime(CLOCK_REALTIME, &ti);
+    uint64_t sec = (uint64_t)ti.tv_sec;
+    uint64_t nsec = (uint64_t)ti.tv_nsec;
+    return sec * (uint64_t)NANOSEC + nsec;
 }
+#endif
 
-static inline double
-realtime_ms(uint64_t t) {
-    return (double)t / NANOSEC * MICROSEC;
+// 读取启动参数：{ mem_profile = "off|on" }
+static bool
+read_arg(lua_State* L, int* out_mem_profile) {
+    if (!out_mem_profile) return false;
+    if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
+
+    // 是否启用 内存 profile
+    lua_getfield(L, 1, "mem_profile");
+    if (lua_isstring(L, -1)) {
+        const char* s = lua_tostring(L, -1);
+        if (strcmp(s, "off") == 0) *out_mem_profile = MODE_OFF;
+        else if (strcmp(s, "on") == 0) *out_mem_profile = MODE_ON;
+        else {printf("invalid mem_profile mode: %s\n", s); return false;}
+    }
+    lua_pop(L, 1);
+
+    return true;
 }
 
 struct call_frame {
@@ -75,6 +338,8 @@ struct profile_context {
     struct imap_context*        symbol_map;
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
+    int         mem_profile_mode;       // MODE_*
+    uint64_t    profile_cost_ns;
 };
 
 struct callpath_node {
@@ -131,6 +396,36 @@ alloc_node_create() {
     return node;
 }
 
+struct dump_call_path_arg {
+    struct profile_context* pcontext;
+    lua_State* L;
+    uint64_t index;
+    uint64_t alloc_bytes_sum;
+    uint64_t free_bytes_sum;
+    uint64_t alloc_times_sum;
+    uint64_t free_times_sum;
+    uint64_t realloc_times_sum;
+};
+
+static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct profile_context* pcontext, lua_State* L) {
+    arg->pcontext = pcontext;
+    arg->L = L;
+    arg->index = 0;
+    arg->alloc_bytes_sum = 0;
+    arg->free_bytes_sum = 0;
+    arg->alloc_times_sum = 0;
+    arg->free_times_sum = 0;
+    arg->realloc_times_sum = 0;
+}
+
+struct sum_root_stat_arg {
+    uint64_t real_cost_sum;
+};
+
+static void _init_sum_root_stat_arg(struct sum_root_stat_arg* arg) {
+    arg->real_cost_sum = 0;
+}
+
 static inline char*
 pstrdup(const char* s) {
     if (!s) return NULL;
@@ -155,6 +450,8 @@ profile_create() {
     context->running_in_hook = false;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
+    context->mem_profile_mode = MODE_OFF;
+    context->profile_cost_ns = 0;
     return context;
 }
 
@@ -252,7 +549,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     if (!context->callpath) {
         struct callpath_node* node = callpath_node_create();
         node->name = "root";
-        node->source = node->name;
+        node->source = "root";
         node->call_count = 1;
         context->callpath = icallpath_create(0, node);
     }
@@ -337,38 +634,28 @@ static inline struct callpath_node* _current_leaf_node(struct profile_context* c
 }
 
 /*
-获取所有类型的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
+获取各种类型函数的 prototype，包括 LUA_VLCL、LUA_VCCL、LUA_VLCF。   
 如果没有正确获取 prototype，那么像 tonumber 和 print 这类 LUA_VLCF 使用栈上的函数指针来充当 prototype,
 会导致同一层的这类函数被合并为同一个节点，比如下面的代码，最终 print 会错误的合并到 tonumber 的节点中，显示为
 2 次 tonumber 调用。 
 
-验证代码:
 local function test1()
-    local profile = require "profile"
-    local json = require "cjson"
-    profile.start()
     tonumber("123")    
     print("111")
-    local result = profile.stop()
-    skynet.error("test1:", json.encode(result))
 end
-test1()
-
-结果可用 https://jsongrid.com/ 查看
 */
 static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
     const void* proto = NULL;
     if (ar->i_ci && ar->i_ci->func.p) {
         const TValue* tv = s2v(ar->i_ci->func.p);
         if (ttislcf(tv)) {
-            // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
-            proto = (const void*)fvalue(tv);
+            proto = (const void*)fvalue(tv);   // LUA_VLCF：轻量 C 函数，直接取 c 函数指针
         } else if (ttisclosure(tv)) {
             const Closure* cl = clvalue(tv);
             if (cl->c.tt == LUA_VLCL) {
-                proto = (const void*)cl->l.p;   // Lua 函数 → Proto*
+                proto = (const void*)cl->l.p;  // LUA_VLCL：Lua 闭包
             } else if (cl->c.tt == LUA_VCCL) {
-                proto = (const void*)cl->c.f; // C 闭包 → lua_CFunction
+                proto = (const void*)cl->c.f;  // LUA_VCCL：C 闭包
             }
         }
     }
@@ -427,7 +714,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // realloc
         
         // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
-        // 1、旧 node，free_bytes 加上 oldsizesize；
+        // 1、旧 node，free_bytes 加上 oldsize；
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1；
 
         // 旧路径
@@ -463,6 +750,8 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
 // hook call/ret 事件
 static void
 _hook_call(lua_State* L, lua_Debug* far) {
+    uint64_t begin_time = get_mono_ns();
+
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("resolve hook fail, profile not started\n");
@@ -474,8 +763,8 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
     context->running_in_hook = true;
 
-    uint64_t cur_time = gettime();
     int event = far->event;
+
     struct call_state* cs = context->cur_cs;
     if (!context->cur_cs || context->cur_cs->co != L) {
         uint64_t key = (uint64_t)((uintptr_t)L);
@@ -489,13 +778,13 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
 
         if (context->cur_cs) {
-            context->cur_cs->leave_time = cur_time;
+            context->cur_cs->leave_time = begin_time;
         }
         context->cur_cs = cs;
     }
     if (cs->leave_time > 0) {
-        assert(cur_time >= cs->leave_time);
-        uint64_t co_cost = cur_time - cs->leave_time;
+        assert(begin_time >= cs->leave_time);
+        uint64_t co_cost = begin_time - cs->leave_time;
 
         for (int i = 0; i < cs->top; i++) {
             cs->call_list[i].co_cost += co_cost;
@@ -513,17 +802,16 @@ _hook_call(lua_State* L, lua_Debug* far) {
         struct call_frame* frame = push_callframe(cs);
         frame->tail = (event == LUA_HOOKTAILCALL);
         frame->co_cost = 0;
-        frame->call_time = cur_time;
         frame->prototype = _get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
         if (frame->path) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
             ++node->call_count;
         }
+        frame->call_time = get_mono_ns();
 
     } else if (event == LUA_HOOKRET) {
-        int len = cs->top;
-        if (len <= 0) {
+        if (cs->top <= 0) {
             context->running_in_hook = false;
             return;
         }
@@ -531,10 +819,10 @@ _hook_call(lua_State* L, lua_Debug* far) {
         do {
             struct call_frame* cur_frame = pop_callframe(cs);
             struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
-            uint64_t total_cost = cur_time - cur_frame->call_time;
+            uint64_t total_cost = begin_time - cur_frame->call_time;
             uint64_t real_cost = total_cost - cur_frame->co_cost;
-            assert(cur_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
-            cur_path->last_ret_time = cur_time;
+            assert(begin_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
+            cur_path->last_ret_time = begin_time;
             cur_path->real_cost += real_cost;
 
             struct call_frame* pre_frame = cur_callframe(cs);
@@ -542,30 +830,8 @@ _hook_call(lua_State* L, lua_Debug* far) {
         } while(tail_call);
     }
 
+    context->profile_cost_ns += (get_mono_ns() - begin_time);
     context->running_in_hook = false;
-}
-
-
-struct dump_call_path_arg {
-    lua_State* L;
-    uint64_t real_cost;
-    uint64_t index;
-    uint64_t alloc_bytes_sum;
-    uint64_t free_bytes_sum;
-    uint64_t alloc_times_sum;
-    uint64_t free_times_sum;
-    uint64_t realloc_times_sum;
-};
-
-static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, lua_State* L) {
-    arg->L = L;
-    arg->real_cost = 0;
-    arg->index = 0;
-    arg->alloc_bytes_sum = 0;
-    arg->free_bytes_sum = 0;
-    arg->alloc_times_sum = 0;
-    arg->free_times_sum = 0;
-    arg->realloc_times_sum = 0;
 }
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
@@ -580,9 +846,9 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_checkstack(arg->L, 3);
     lua_newtable(arg->L);
 
-    // 递归获取所有子结点的指标和
+    // 递归获取所有子节点的指标和
     struct dump_call_path_arg child_arg;
-    _init_dump_call_path_arg(&child_arg, arg->L);
+    _init_dump_call_path_arg(&child_arg, arg->pcontext, arg->L);
     if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
         icallpath_dump_children(path, _dump_call_path_child, &child_arg);
@@ -591,19 +857,19 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
 
-    // 本节点的聚合指标=本节点指标+所有子结点的指标
+    // 本节点的聚合指标=本节点指标+所有子节点的指标
     uint64_t alloc_bytes_incl = node->alloc_bytes + child_arg.alloc_bytes_sum;
     uint64_t free_bytes_incl = node->free_bytes + child_arg.free_bytes_sum;
     uint64_t alloc_times_incl = node->alloc_times + child_arg.alloc_times_sum;
     uint64_t free_times_incl = node->free_times + child_arg.free_times_sum;
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
-    uint64_t real_cost = node->real_cost + child_arg.real_cost;
+
     // 本节点的其他指标
+    uint64_t real_cost = node->real_cost;
     uint64_t call_count = node->call_count;
-    uint64_t inuse_bytes = alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999;
+    uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
-    arg->real_cost += real_cost;
     arg->alloc_bytes_sum += alloc_bytes_incl;
     arg->free_bytes_sum += free_bytes_incl;
     arg->alloc_times_sum += alloc_times_incl;
@@ -616,38 +882,77 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushstring(arg->L, name);
     lua_setfield(arg->L, -2, "name");
 
+    lua_pushinteger(arg->L, node->last_ret_time);
+    lua_setfield(arg->L, -2, "last_ret_time");
+    
     lua_pushinteger(arg->L, call_count);
     lua_setfield(arg->L, -2, "call_count");
 
     lua_pushinteger(arg->L, real_cost);
     lua_setfield(arg->L, -2, "cpu_cost_ns");
 
-    lua_pushinteger(arg->L, node->last_ret_time);
-    lua_setfield(arg->L, -2, "last_ret_time");
+    uint64_t parent_real_cost = 0;
+    if (node->parent) {
+        parent_real_cost = node->parent->real_cost;
+    }
+    double percent = parent_real_cost > 0 ? ((double)real_cost / parent_real_cost * 100.0) : 100;
+    char percent_str[32] = {0};
+    snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
+    lua_pushstring(arg->L, percent_str);
+    lua_setfield(arg->L, -2, "cpu_cost_percent");
 
-    lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
-    lua_setfield(arg->L, -2, "alloc_bytes");
+    if (MODE_ON == arg->pcontext->mem_profile_mode) {
+        lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
+        lua_setfield(arg->L, -2, "alloc_bytes");
 
-    lua_pushinteger(arg->L, (lua_Integer)free_bytes_incl);
-    lua_setfield(arg->L, -2, "free_bytes");
+        lua_pushinteger(arg->L, (lua_Integer)free_bytes_incl);
+        lua_setfield(arg->L, -2, "free_bytes");
 
-    lua_pushinteger(arg->L, (lua_Integer)alloc_times_incl);
-    lua_setfield(arg->L, -2, "alloc_times");
+        lua_pushinteger(arg->L, (lua_Integer)alloc_times_incl);
+        lua_setfield(arg->L, -2, "alloc_times");
 
-    lua_pushinteger(arg->L, (lua_Integer)free_times_incl);
-    lua_setfield(arg->L, -2, "free_times");
+        lua_pushinteger(arg->L, (lua_Integer)free_times_incl);
+        lua_setfield(arg->L, -2, "free_times");
 
-    lua_pushinteger(arg->L, (lua_Integer)realloc_times_incl);
-    lua_setfield(arg->L, -2, "realloc_times");
+        lua_pushinteger(arg->L, (lua_Integer)realloc_times_incl);
+        lua_setfield(arg->L, -2, "realloc_times");
 
-    lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
-    lua_setfield(arg->L, -2, "inuse_bytes");
+        lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
+        lua_setfield(arg->L, -2, "inuse_bytes");
+    }
+
+    if (path == arg->pcontext->callpath) {
+        lua_pushinteger(arg->L, arg->pcontext->profile_cost_ns);
+        lua_setfield(arg->L, -2, "profile_cost_ns");
+    }
 }
 
-static void dump_call_path(lua_State* L, struct icallpath_context* path) {
+static void sum_root_stat(uint64_t key, void* value, void* ud) {
+    struct sum_root_stat_arg* arg = (struct sum_root_stat_arg*)ud;
+    struct icallpath_context* path = (struct icallpath_context*)value;
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    arg->real_cost_sum += node->real_cost;
+}
+
+static void update_root_stat(struct profile_context* pcontext, lua_State* L) {
+    struct icallpath_context* path = pcontext->callpath;
+    if (!path) return;
+    struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(path);
+    if (!root) return;
+
+    root->last_ret_time = get_mono_ns();
+    if (icallpath_children_size(path) > 0) {
+        struct sum_root_stat_arg arg;
+        _init_sum_root_stat_arg(&arg);
+        icallpath_dump_children(path, sum_root_stat, &arg);
+        root->real_cost = arg.real_cost_sum;
+    }
+}
+
+static void dump_call_path(struct profile_context* pcontext, lua_State* L) {
     struct dump_call_path_arg arg;
-    _init_dump_call_path_arg(&arg, L);
-    _dump_call_path(path, &arg);
+    _init_dump_call_path_arg(&arg, pcontext, L);
+    _dump_call_path(pcontext->callpath, &arg);
 }
 
 static int 
@@ -666,68 +971,65 @@ get_all_coroutines(lua_State* L, lua_State** result, int maxsize) {
     return i;
 }
 
-static void
-_hook_all_co(lua_State* L) {
+static int _stop_gc_if_need(lua_State* L) {
     // stop gc before set hook
     int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
     if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
-    lua_State* states[MAX_CO_SIZE] = {0};
-    int i = get_all_coroutines(L, states, MAX_CO_SIZE);
-    for (i = i - 1; i >= 0; i--) {
-        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
-    }
-    if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+    return gc_was_running;
 }
 
-static void 
-_unhook_all_co(lua_State* L) {
-    // stop gc before unset hook
-    int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
-    if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }     
-    lua_State* states[MAX_CO_SIZE] = {0};
-    int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
-    int i;
-    for (i = sz - 1; i >= 0; i--) {
-        lua_sethook(states[i], NULL, 0, 0);
-    }
+static void _restart_gc_if_need(lua_State* L, int gc_was_running) {
     if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
 }
 
 static int
-_lstart(lua_State* L) {
+lstart(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context != NULL) {
         printf("start fail, profile already started\n");
         return 0;
     }
 
-    lua_gc(L, LUA_GCCOLLECT, 0);  // full gc  
+    // parse options: start([opts]), opts is a table
+    int mem_profile_mode = MODE_OFF;  // default
+    bool read_ok = read_arg(L, &mem_profile_mode);
+    if (!read_ok) {
+        printf("start fail, invalid options\n");
+        return 0;
+    }
+
+    // full gc before start, make mem profile more accurate
+    if (MODE_ON == mem_profile_mode) {
+        lua_gc(L, LUA_GCCOLLECT, 0);  
+    }
 
     context = profile_create();
     context->running_in_hook = true;
-    context->start_time = gettime();
+    context->start_time = get_mono_ns();
     context->is_ready = true;
+    context->mem_profile_mode = mem_profile_mode;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    lua_setallocf(L, _hook_alloc, context);
+    if (MODE_ON == mem_profile_mode) {
+        lua_setallocf(L, _hook_alloc, context);
+    }
     set_profile_context(L, context);
-    _hook_all_co(L);
     context->running_in_hook = false;
-    printf("luaprofile started, last_alloc_ud = %p\n", context->last_alloc_ud);    
+    
+    printf("luaprofile started, mem_profile_mode = %d, last_alloc_ud = %p\n", context->mem_profile_mode, context->last_alloc_ud);    
     return 0;
 }
 
 static int
-_lstop(lua_State* L) {
+lstop(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("stop fail, profile not started\n");
         return 0;
     }
-    
+
     context->running_in_hook = true;
     context->is_ready = false;
     lua_setallocf(L, context->last_alloc_f, context->last_alloc_ud);
-    _unhook_all_co(L);
     unset_profile_context(L);
     profile_free(context);
     context = NULL;
@@ -736,7 +1038,7 @@ _lstop(lua_State* L) {
 }
 
 static int
-_lmark(lua_State* L) {
+lmark(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("mark fail, profile not started\n");
@@ -754,7 +1056,7 @@ _lmark(lua_State* L) {
 }
 
 static int
-_lunmark(lua_State* L) {
+lunmark(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("unmark fail, profile not started\n");
@@ -769,38 +1071,123 @@ _lunmark(lua_State* L) {
 }
 
 static int
-_ldump(lua_State* L) {
+lmark_all(lua_State* L) {
+    struct profile_context* ctx = get_profile_context(L);
+    if (!ctx) {
+        printf("mark all co fail, profile not started\n");
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "profile not started");
+        return 2;
+    }
+
+    int gc_was_running = _stop_gc_if_need(L);
+
+    lua_State* states[MAX_CO_SIZE] = {0};
+    int i = get_all_coroutines(L, states, MAX_CO_SIZE);
+    for (i = i - 1; i >= 0; i--) {
+        lua_sethook(states[i], _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
+    }
+    _restart_gc_if_need(L, gc_was_running);
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int 
+lunmark_all(lua_State* L) {
+    struct profile_context* ctx = get_profile_context(L);
+    if (!ctx) {
+        printf("unhook all co fail, profile not started\n");
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "profile not started");
+        return 2;
+    }
+    // stop gc before unset hook
+    int gc_was_running = _stop_gc_if_need(L); 
+    lua_State* states[MAX_CO_SIZE] = {0};
+    int sz = get_all_coroutines(L, states, MAX_CO_SIZE);
+    int i;
+    for (i = sz - 1; i >= 0; i--) {
+        lua_sethook(states[i], NULL, 0, 0);
+    }
+    _restart_gc_if_need(L, gc_was_running);
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int
+ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
-    if (context && context->callpath) {
-        // full gc
-        lua_gc(L, LUA_GCCOLLECT, 0);
+    if (context) {
+        // full gc to free objects, make mem profile more accurate
+        if (MODE_ON ==context->mem_profile_mode) {
+            lua_gc(L, LUA_GCCOLLECT, 0);
+        }
 
         // stop gc before dump
-        int gc_was_running = lua_gc(L, LUA_GCISRUNNING, 0);
-        if (gc_was_running) { lua_gc(L, LUA_GCSTOP, 0); }
+        int gc_was_running = _stop_gc_if_need(L); 
         context->running_in_hook = true;
-        uint64_t cur_time = gettime();
-        struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
-        root->last_ret_time = cur_time;            
-        uint64_t profile_time = cur_time - context->start_time;
-        lua_pushinteger(L, profile_time);
-        dump_call_path(L, context->callpath);
+
+        uint64_t cur_time = get_mono_ns();
+        double profile_duration = (cur_time - context->start_time)*1.0/NANOSEC;
+        lua_pushnumber(L, profile_duration);
+
+        // tracing dump
+        if (context->callpath) {
+            update_root_stat(context, L);
+            dump_call_path(context, L);
+        } else {
+            lua_newtable(L);
+        }
+
         context->running_in_hook = false;
-        if (gc_was_running) { lua_gc(L, LUA_GCRESTART, 0); }
+        _restart_gc_if_need(L, gc_was_running);
         return 2;
     }
     return 0;
 }
 
+static int lget_mono_ns(lua_State* L) {
+    lua_pushinteger(L, get_mono_ns());
+    return 1;
+}
+
+// sleep(seconds): 使用 POSIX nanosleep，支持小数秒，自动处理被信号打断
+static int lsleep(lua_State* L) {
+    lua_Number sec = luaL_checknumber(L, 1);
+    if (sec < 0) sec = 0;
+
+    lua_Number integral = 0;
+    lua_Number frac = modf(sec, &integral);
+
+    struct timespec req;
+    req.tv_sec = (time_t)integral;
+    long nsec = (long)(frac * 1.0 * NANOSEC);
+    if (nsec < 0) nsec = 0;
+    if (nsec >= NANOSEC) {
+        req.tv_sec += 1;
+        nsec -= NANOSEC;
+    }
+    req.tv_nsec = nsec;
+
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+        // 被信号中断则继续睡剩余时间
+    }
+    return 0;
+}
+
 int
-luaopen_luaprofilec(lua_State* L) {
+luaopen_luaprofilecore(lua_State* L) {
     luaL_checkversion(L);
      luaL_Reg l[] = {
-        {"start", _lstart},
-        {"stop", _lstop},
-        {"mark", _lmark},
-        {"unmark", _lunmark},
-        {"dump", _ldump},
+        {"start", lstart},
+        {"stop", lstop},
+        {"mark", lmark},
+        {"unmark", lunmark},
+        {"mark_all", lmark_all},
+        {"unmark_all", lunmark_all},
+        {"dump", ldump},
+        {"getnanosec", lget_mono_ns},
+        {"sleep", lsleep},
         {NULL, NULL},
     };
     luaL_newlib(L, l);
