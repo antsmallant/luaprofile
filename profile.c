@@ -1,12 +1,6 @@
 // This file is modified version from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
-#endif
 
 #include "profile.h"
-#include "imap.h"
-#include "smap.h"
-#include "icallpath.h"
 #include "lobject.h"
 #include "lfunc.h"
 #include "lstate.h"
@@ -18,7 +12,6 @@
 #include <math.h>
 #include <time.h>
 #include <errno.h>
-#include "lprof.h"
 #include <signal.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -42,177 +35,244 @@ node1
 #define MAX_CO_SIZE                 1024
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
-#define MAX_SAMPLE_DEPTH            256
 
 // 模式定义（统一用于 CPU/Memory）
 #define MODE_OFF                    0
 #define MODE_PROFILE                1
 #define MODE_SAMPLE                 2
 
-#define DEFAULT_CPU_SAMPLE_HZ       250
+#define DEFAULT_IMAP_SLOT_SIZE  1024
 
 static char profile_context_key = 'x';
 
+struct icallpath_context {
+    uint64_t key;
+    void* value;
+    struct imap_context* children;
+};
 
-// forward decl for trap callback implemented later (needs structs defined)
-static void _on_prof_trap_n(lua_State* L, unsigned int n);
+enum imap_status {
+    IS_NONE,
+    IS_EXIST,
+    IS_REMOVE,
+};
 
-#ifdef LUA_PROF_TRAP
-// -------- CPU sampling (TLS + per-thread timer + signal handler) --------
-static int start_thread_timer_hz(int hz);
-static void stop_thread_timer(void);
-static __thread lua_State* g_prof_current_L = NULL;
-static __thread timer_t g_prof_timerid;
-static int g_prof_signo = 0; // assigned on install
-static __thread uintptr_t g_stack_lo = 0;
-static __thread uintptr_t g_stack_hi = 0;
-static char g_self_module[128];
+struct imap_slot {
+    uint64_t key;
+    void* value;
+    enum imap_status status;
+    struct imap_slot* next;
+};
 
-#define C_RB_CAP 8192
-#define C_MAX_FRAMES 64
-typedef struct {
-    uint16_t depth;
-    uintptr_t pcs[C_MAX_FRAMES];
-} c_sample_t;
-static __thread c_sample_t g_c_rb[C_RB_CAP];
-static __thread unsigned g_c_rb_head = 0;
+struct imap_context {
+    struct imap_slot* slots;
+    size_t size;
+    size_t count;
+    struct imap_slot* lastfree;
+};
 
-/* write helpers (async-signal-safe) */
-static inline void _hex_nibble(char n, char* out) {
-    *out = (n < 10) ? ('0' + n) : ('a' + (n - 10));
+typedef void(*observer)(uint64_t key, void* value, void* ud);
+static void imap_set(struct imap_context* imap, uint64_t key, void* value);
+static void icallpath_free(struct icallpath_context* icallpath);
+
+static struct imap_context *
+imap_create(void) {
+    struct imap_context* imap = (struct imap_context*)pmalloc(sizeof(*imap));
+    imap->slots = (struct imap_slot*)pcalloc(DEFAULT_IMAP_SLOT_SIZE, sizeof(struct imap_slot));
+    imap->size = DEFAULT_IMAP_SLOT_SIZE;
+    imap->count = 0;
+    imap->lastfree = imap->slots + imap->size;
+    return imap;
 }
-static size_t _hex_ptr(uintptr_t v, char* buf) {
-    char tmp[2 + sizeof(uintptr_t) * 2];
-    size_t p = 0;
-    tmp[p++] = '0'; tmp[p++] = 'x';
-    int started = 0;
-    for (int i = (int)(sizeof(uintptr_t) * 2 - 1); i >= 0; --i) {
-        char nib = (char)((v >> (i * 4)) & 0xf);
-        if (!started && nib == 0 && i != 0) continue;
-        started = 1;
-        _hex_nibble(nib, tmp + p);
-        p++;
+
+static void
+imap_free(struct imap_context* imap) {
+    pfree(imap->slots);
+    pfree(imap);
+}
+
+static inline uint64_t
+_imap_hash(struct imap_context* imap, uint64_t key) {
+    uint64_t hash = key % (uint64_t)(imap->size);
+    return hash;
+}
+
+static void
+_imap_rehash(struct imap_context* imap) {
+    size_t new_sz = DEFAULT_IMAP_SLOT_SIZE;
+    struct imap_slot* old_slots = imap->slots;
+    size_t old_count = imap->count;
+    size_t old_size = imap->size;
+    while(new_sz <= imap->count) {
+        new_sz *= 2;
     }
-    for (size_t i = 0; i < p; ++i) buf[i] = tmp[i];
-    return p;
-}
 
-static void prof_sig_handler(int sig, siginfo_t* si, void* uctx) {
-    (void)sig; (void)si; (void)uctx;
-    lua_State* L = g_prof_current_L;
-    if (L) {
-        if (L->prof_ticks < 0x7fffffffU) {
-            L->prof_ticks++;
+    struct imap_slot* new_slots = (struct imap_slot*)pcalloc(new_sz, sizeof(struct imap_slot));
+    imap->lastfree = new_slots + new_sz;
+    imap->size = new_sz;
+    imap->slots = new_slots;
+    imap->count = 0;
+
+    size_t i=0;
+    for(i=0; i<old_size; i++) {
+        struct imap_slot* p = &(old_slots[i]);
+        enum imap_status status = p->status;
+        if(status == IS_EXIST) {
+            imap_set(imap, p->key, p->value);
         }
     }
 
-    /* Grab C stack (best-effort, x86_64) and print one folded line to stderr */
-#if defined(__x86_64__)
-    ucontext_t* ctx = (ucontext_t*)uctx;
-    uintptr_t ip = 0, bp = 0;
-# ifdef REG_RIP
-    ip = (uintptr_t)ctx->uc_mcontext.gregs[REG_RIP];
-# endif
-# ifdef REG_RBP
-    bp = (uintptr_t)ctx->uc_mcontext.gregs[REG_RBP];
-# endif
-    /* collect frames into TLS ring buffer */
-    unsigned idx = g_c_rb_head++ % C_RB_CAP;
-    c_sample_t* cs = &g_c_rb[idx];
-    cs->depth = 0;
-    if (ip && cs->depth < C_MAX_FRAMES) {
-        cs->pcs[cs->depth++] = ip;
-    }
-    uintptr_t lo = g_stack_lo, hi = g_stack_hi;
-    int depth = 0;
-    while (bp && bp >= lo && (bp + 2 * sizeof(uintptr_t)) < hi && depth < 64) {
-        /* ret address at [bp + sizeof(void*)], next bp at [bp] */
-        uintptr_t next_bp = 0;
-        uintptr_t ret = 0;
-        /* guard against invalid memory by simple bounds checks */
-        next_bp = *((uintptr_t*)bp);
-        ret = *((uintptr_t*)(bp + sizeof(uintptr_t)));
-        if (next_bp <= bp || next_bp >= hi) break;
-        if (cs->depth < C_MAX_FRAMES) {
-            cs->pcs[cs->depth++] = ret;
-        }
-        bp = next_bp;
-        depth++;
-    }
-#else
-    (void)uctx;
-#endif
+    assert(old_count == imap->count);
+    pfree(old_slots);
 }
 
-static int install_prof_signal_once(void) {
-    if (g_prof_signo != 0) return 0;
-    int signo = SIGRTMIN + 1;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = prof_sig_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    if (sigaction(signo, &sa, NULL) != 0) return -1;
-    g_prof_signo = signo;
-    /* identify our own module basename for later frame filtering */
-    Dl_info di;
-    if (dladdr((void*)&prof_sig_handler, &di) && di.dli_fname) {
-        const char* base = strrchr(di.dli_fname, '/');
-        base = base ? base + 1 : di.dli_fname;
-        size_t n = strlen(base);
-        if (n >= sizeof(g_self_module)) n = sizeof(g_self_module) - 1;
-        memcpy(g_self_module, base, n);
-        g_self_module[n] = '\0';
-    } else {
-        g_self_module[0] = '\0';
-    }
-    return 0;
-}
-
-static int start_thread_timer_hz(int hz) {
-    if (hz <= 0) hz = 250;
-    if (install_prof_signal_once() != 0) return -1;
-    /* cache stack bounds for safe FP walk */
-    {
-        pthread_attr_t attr;
-        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
-            void* stackaddr = NULL;
-            size_t stacksize = 0;
-            if (pthread_attr_getstack(&attr, &stackaddr, &stacksize) == 0) {
-                g_stack_lo = (uintptr_t)stackaddr;
-                g_stack_hi = (uintptr_t)stackaddr + stacksize;
+static struct imap_slot *
+_imap_query(struct imap_context* imap, uint64_t key) {
+    uint64_t hash = _imap_hash(imap, key);
+    struct imap_slot* p = &(imap->slots[hash]);
+    if(p->status != IS_NONE) {
+        while(p) {
+            if(p->key == key && p->status == IS_EXIST) {
+                return p;
             }
-            pthread_attr_destroy(&attr);
+            p = p->next;
         }
     }
-    struct sigevent sev;
-    memset(&sev, 0, sizeof(sev));
-#ifdef SIGEV_THREAD_ID
-    sev.sigev_notify = SIGEV_THREAD_ID;
-    sev._sigev_un._tid = (int)syscall(SYS_gettid);
-#else
-    // Fallback: process-directed; acceptable in single-threaded lua
-    sev.sigev_notify = SIGEV_SIGNAL;
-#endif
-    sev.sigev_signo = g_prof_signo;
-    if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &g_prof_timerid) != 0) return -1;
-    struct itimerspec its;
-    memset(&its, 0, sizeof(its));
-    its.it_value.tv_nsec = 1000000000LL / hz;
-    its.it_interval.tv_nsec = its.it_value.tv_nsec;
-    if (timer_settime(g_prof_timerid, 0, &its, NULL) != 0) return -1;
-    return 0;
+    return NULL;
 }
 
-static void stop_thread_timer(void) {
-    struct itimerspec its;
-    memset(&its, 0, sizeof(its));
-    timer_settime(g_prof_timerid, 0, &its, NULL);
-    timer_delete(g_prof_timerid);
-    memset(&g_prof_timerid, 0, sizeof(g_prof_timerid));
+static void *
+imap_query(struct imap_context* imap, uint64_t key) {
+    struct imap_slot* p = _imap_query(imap, key);
+    if(p) {
+        return p->value;
+    }
+    return NULL;
 }
-#endif
 
+static struct imap_slot *
+_imap_getfree(struct imap_context* imap) {
+    while(imap->lastfree > imap->slots) {
+        imap->lastfree--;
+        if(imap->lastfree->status == IS_NONE) {
+            return imap->lastfree;
+        }
+    }
+    return NULL;
+}
+
+static void
+imap_set(struct imap_context* imap, uint64_t key, void* value) {
+    assert(value);
+    uint64_t hash = _imap_hash(imap, key);
+    struct imap_slot* p = &(imap->slots[hash]);
+    if(p->status == IS_EXIST) {
+        struct imap_slot* np = p;
+        while(np) {
+            if(np->key == key && np->status == IS_EXIST) {
+                np->value = value;
+                return;
+            }
+            np = np->next;
+        }
+
+        np = _imap_getfree(imap);
+        if(np == NULL) {
+            _imap_rehash(imap);
+            imap_set(imap, key, value);
+            return;
+        }
+
+        uint64_t main_hash = _imap_hash(imap, p->key);
+        np->next = p->next;
+        p->next = np;
+        if(main_hash == hash) {
+            p = np;
+        }else {
+            np->key = p->key;
+            np->value = p->value;
+            np->status = IS_EXIST;
+        }
+    }
+
+    imap->count++;
+    p->status = IS_EXIST;
+    p->key = key;
+    p->value = value;
+}
+
+static void *
+imap_remove(struct imap_context* imap, uint64_t key) {
+    struct imap_slot* p = _imap_query(imap, key);
+    if(p) {
+        imap->count--;
+        p->status = IS_REMOVE;
+        return p->value;
+    }
+    return NULL;
+}
+
+static void
+imap_dump(struct imap_context* imap, observer observer_cb, void* ud) {
+    size_t i=0;
+    for(i=0; i<imap->size; i++) {
+        struct imap_slot* v = &imap->slots[i];
+        if(v->status == IS_EXIST) {
+            observer_cb(v->key, v->value, ud);
+        }
+    }
+}
+
+static size_t
+imap_size(struct imap_context* imap) {
+    return imap->count;
+}
+
+static struct icallpath_context* icallpath_create(uint64_t key, void* value) {
+    struct icallpath_context* icallpath = (struct icallpath_context*)pmalloc(sizeof(*icallpath));
+    icallpath->key = key;
+    icallpath->value = value;
+    icallpath->children = imap_create();
+
+    return icallpath;
+}
+
+static void icallpath_free_child(uint64_t key, void* value, void* ud) {
+    icallpath_free((struct icallpath_context*)value);
+}
+
+static void icallpath_free(struct icallpath_context* icallpath) {
+    if (icallpath->value) {
+        pfree(icallpath->value);
+        icallpath->value = NULL;
+    }
+    imap_dump(icallpath->children, icallpath_free_child, NULL);
+    imap_free(icallpath->children);
+    pfree(icallpath);
+}
+
+static struct icallpath_context* icallpath_get_child(struct icallpath_context* icallpath, uint64_t key) {
+    void* child_path = imap_query(icallpath->children, key);
+    return (struct icallpath_context*)child_path;
+}
+
+static struct icallpath_context* icallpath_add_child(struct icallpath_context* icallpath, uint64_t key, void* value) {
+    struct icallpath_context* child_path = icallpath_create(key, value);
+    imap_set(icallpath->children, key, child_path);
+    return child_path;
+}
+
+static void* icallpath_getvalue(struct icallpath_context* icallpath) {
+    return icallpath->value;
+}
+
+static void icallpath_dump_children(struct icallpath_context* icallpath, observer observer_cb, void* ud) {
+    imap_dump(icallpath->children, observer_cb, ud);
+}
+
+static size_t icallpath_children_size(struct icallpath_context* icallpath) {
+    return imap_size(icallpath->children);
+}
 
 // 获取单调递增的时间戳（纳秒），不会被 NTP 调整。
 // 只用于计算时间差，不能当成绝对时间戳用于获取当前的年月日。
@@ -237,13 +297,12 @@ get_realtime_ns() {
     return sec * (uint64_t)NANOSEC + nsec;
 }
 
-// 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample", cpu_sample_hz = int }
+// 读取启动参数：{ cpu = "off|profile|sample", mem = "off|profile|sample" }
 static bool
-read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_cpu_sample_hz) {
-    if (!out_cpu_mode || !out_mem_mode || !out_cpu_sample_hz) return false;
+read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode) {
+    if (!out_cpu_mode || !out_mem_mode) return false;
     *out_cpu_mode = MODE_PROFILE;
     *out_mem_mode = MODE_PROFILE;
-    *out_cpu_sample_hz = DEFAULT_CPU_SAMPLE_HZ;
     if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
 
     lua_getfield(L, 1, "cpu");
@@ -266,12 +325,6 @@ read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode, int* out_cpu_sample
     }
     lua_pop(L, 1);
 
-    lua_getfield(L, 1, "cpu_sample_hz");
-    if (lua_isinteger(L, -1)) {
-        int sp = (int)lua_tointeger(L, -1);
-        if (sp > 0) *out_cpu_sample_hz = sp;
-    }
-    lua_pop(L, 1);
     return true;
 }
 
@@ -299,14 +352,10 @@ struct profile_context {
     struct imap_context*        cs_map;
     struct imap_context*        alloc_map;
     struct imap_context*        symbol_map;
-    smap_t*                     sample_map;   // folded stacks for lua cpu sampling
-    smap_t*                     c_sample_map; // folded stacks for c cpu sampling
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
     int         cpu_mode;       // MODE_*
     int         mem_mode;       // MODE_*
-    int         cpu_sample_hz;  // instruction count for LUA_MASKCOUNT
-    uint64_t    rng_state;      // RNG state for sampling gaps
     uint64_t    profile_cost_ns;
 };
 
@@ -337,9 +386,6 @@ struct symbol_info {
     char* source;
     int line;
 };
-
-// 简单的字符串 HashMap（链式散列），用于 CPU 抽样折叠栈
-// use external smap
 
 static struct callpath_node*
 callpath_node_create() {
@@ -409,262 +455,6 @@ pstrdup(const char* s) {
     return d;
 }
 
-// free counters stored as smap values (uint64_t*)
-static void _free_counter_cb(const char* key, void* value, void* ud) {
-    (void)key; (void)ud;
-    if (value) pfree(value);
-}
-
-struct smap_dump_ctx {
-    lua_State* L;
-    size_t idx;
-};
-
-struct fg_dump_ctx {
-    luaL_Buffer* buf;
-    struct imap_context* symbol_map;
-};
-
-static void _fg_dump_cb(const char* key, void* value, void* ud) {
-    struct fg_dump_ctx* ctx = (struct fg_dump_ctx*)ud;
-    luaL_Buffer* b = ctx->buf;
-    uint64_t samples = value ? *(uint64_t*)value : 0;
-    if (samples == 0) return;
-    const char* p = key;
-    char token[64];
-    size_t tlen = 0;
-    int first = 1;
-    while (1) {
-        char c = *p++;
-        if (c == ';' || c == '\0') {
-            token[tlen] = '\0';
-            void* fptr = NULL;
-            sscanf(token, "%p", &fptr);
-            uint64_t sym_key = (uint64_t)((uintptr_t)fptr);
-            struct symbol_info* si = (struct symbol_info*)imap_query(ctx->symbol_map, sym_key);
-            if (!first) luaL_addchar(b, ';');
-            if (si) {
-                char namebuf[512];
-                const char* nm = (si->name && si->name[0]) ? si->name : "anonymous";
-                const char* src = (si->source && si->source[0]) ? si->source : "(source)";
-                int ln = si->line;
-                int n = snprintf(namebuf, sizeof(namebuf)-1, "%s %s:%d", nm, src, ln);
-                if (n > 0) luaL_addlstring(b, namebuf, (size_t)n);
-            } else {
-                luaL_addlstring(b, token, tlen);
-            }
-            tlen = 0;
-            first = 0;
-            if (c == '\0') break;
-        } else {
-            if (tlen + 1 < sizeof(token)) token[tlen++] = c;
-        }
-    }
-    char tail[64];
-    int m = snprintf(tail, sizeof(tail)-1, " %llu\n", (unsigned long long)samples);
-    if (m > 0) luaL_addlstring(b, tail, (size_t)m);
-}
-
-/* write c_sample_map entries to file */
-static void _cmap_write_cb(const char* key, void* value, void* ud) {
-    FILE* fp = (FILE*)ud;
-    if (!fp) return;
-    uint64_t samples = value ? *(uint64_t*)value : 0;
-    if (samples == 0) return;
-    fprintf(fp, "%s %llu\n", key, (unsigned long long)samples);
-}
-
-/* ---- Dump helpers (refactor) ---- */
-static void fold_c_tls_samples(struct profile_context* context) {
-    if (!context || !context->c_sample_map) return;
-    unsigned cap = C_RB_CAP;
-    for (unsigned i = 0; i < cap; ++i) {
-        c_sample_t* cs = &g_c_rb[i];
-        if (cs->depth == 0) continue;
-        char keybuf[4096];
-        size_t kp = 0;
-        /* choose start index (from leaf side): skip frames belonging to our module or vdso/sig trampolines */
-        int start_idx_leaf = 0;
-        for (int d = 0; d < cs->depth; ++d) { /* leaf -> root scan to find first non-internal leaf */
-            Dl_info info;
-            const char* so = NULL;
-            const char* name = NULL;
-            if (dladdr((void*)cs->pcs[d], &info)) {
-                so = info.dli_fname;
-                name = info.dli_sname;
-            }
-            const char* base = so ? strrchr(so, '/') : NULL;
-            base = base ? base + 1 : so;
-            int is_self = (base && g_self_module[0] && strcmp(base, g_self_module) == 0);
-            int is_vdso = (base && strstr(base, "linux-vdso") != NULL);
-            int is_sigret = (name && (strstr(name, "__restore_rt") || strstr(name, "rt_sigreturn")));
-            if (!(is_self || is_vdso || is_sigret)) {
-                start_idx_leaf = d;
-                break;
-            }
-        }
-        /* build root->leaf order for FlameGraph (reverse from depth-1 down to start_idx_leaf) */
-        for (int d = cs->depth - 1; d >= start_idx_leaf; --d) {
-            Dl_info info;
-            const char* name = NULL;
-            const char* so = NULL;
-            if (dladdr((void*)cs->pcs[d], &info)) {
-                if (info.dli_sname && info.dli_sname[0]) name = info.dli_sname;
-                if (info.dli_fname && info.dli_fname[0]) so = info.dli_fname;
-            }
-            /* build display name */
-            char namebuf[384];
-            if (name && name[0]) {
-                /* module!symbol+offset */
-                uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
-                uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : 0;
-                const char* modbase = so ? (strrchr(so, '/') ? strrchr(so, '/') + 1 : so) : "unknown";
-                snprintf(namebuf, sizeof(namebuf), "%s!%s+0x%lx", modbase, name, (unsigned long)off);
-            } else if (so && so[0]) {
-                /* basename(so)+offset */
-                const char* base = strrchr(so, '/');
-                base = base ? base + 1 : so;
-                uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
-                uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : (uintptr_t)cs->pcs[d];
-                snprintf(namebuf, sizeof(namebuf), "%s+0x%lx", base, (unsigned long)off);
-            } else {
-                char hex[2 + sizeof(uintptr_t) * 2 + 1];
-                size_t hn = _hex_ptr(cs->pcs[d], hex);
-                hex[hn] = '\0';
-                snprintf(namebuf, sizeof(namebuf), "%s", hex);
-            }
-            size_t nlen = strlen(namebuf);
-            if (kp + nlen + 1 >= sizeof(keybuf)) break;
-            if (kp > 0) keybuf[kp++] = ';';
-            memcpy(keybuf + kp, namebuf, nlen);
-            kp += nlen;
-        }
-        keybuf[kp] = '\0';
-        if (kp > 0) {
-            uint64_t* cnt = (uint64_t*)smap_get(context->c_sample_map, keybuf);
-            if (!cnt) {
-                char* keydup = pstrdup(keybuf);
-                cnt = (uint64_t*)pmalloc(sizeof(uint64_t));
-                *cnt = 0;
-                smap_set(context->c_sample_map, keydup, cnt);
-            }
-            (*cnt)++;
-        }
-        /* do not clear here; allow other consumers (e.g. raw writer) to read; clear once after both done */
-    }
-}
-
-static void write_c_samples_file(struct profile_context* context, const char* path) {
-    if (!context || !context->c_sample_map || !path) return;
-    FILE* fp = fopen(path, "w");
-    if (!fp) return;
-    smap_iterate(context->c_sample_map, _cmap_write_cb, fp);
-    fclose(fp);
-}
-
-static void push_lua_folded_samples(lua_State* L, struct profile_context* context) {
-    luaL_Buffer b;
-    luaL_buffinit(L, &b);
-    struct fg_dump_ctx fctx = { .buf = &b, .symbol_map = context->symbol_map };
-    smap_iterate(context->sample_map, _fg_dump_cb, &fctx);
-    luaL_pushresult(&b);
-}
-
-static void write_c_samples_raw(const char* path) {
-    if (!path) return;
-    FILE* fp = fopen(path, "w");
-    if (!fp) return;
-    unsigned cap = C_RB_CAP;
-    for (unsigned i = 0; i < cap; ++i) {
-        c_sample_t* cs = &g_c_rb[i];
-        if (cs->depth == 0) continue;
-        size_t written = 0;
-        /* raw output: module!0xoffset chain in root->leaf order */
-        for (int d = cs->depth - 1; d >= 0; --d) {
-            Dl_info info;
-            const char* so = NULL;
-            if (dladdr((void*)cs->pcs[d], &info)) {
-                if (info.dli_fname && info.dli_fname[0]) so = info.dli_fname;
-            }
-            const char* modbase = "unknown";
-            if (so && so[0]) {
-                const char* base = strrchr(so, '/');
-                modbase = base ? base + 1 : so;
-            }
-            uintptr_t baseaddr = info.dli_fbase ? (uintptr_t)info.dli_fbase : 0;
-            uintptr_t off = baseaddr ? (uintptr_t)cs->pcs[d] - baseaddr : (uintptr_t)cs->pcs[d];
-            fprintf(fp, "%s!0x%lx", modbase, (unsigned long)off);
-            written++;
-            if (d > 0) fputc(';', fp);
-        }
-        if (written > 0) fputc('\n', fp);
-    }
-    fclose(fp);
-}
-
-/* gperftools legacy cpuprofile format writer */
-static void write_c_profile_pprof(struct profile_context* context, const char* path) {
-    if (!path) return;
-    FILE* fp = fopen(path, "wb");
-    if (!fp) return;
-
-    /* header: slots of pointer width, native endian */
-    uintptr_t hdr[5];
-    hdr[0] = (uintptr_t)0;         /* header count = 0 */
-    hdr[1] = (uintptr_t)3;         /* header slots after this one = 3 */
-    hdr[2] = (uintptr_t)0;         /* version = 0 */
-    uint64_t period_us64 = 0;
-    int hz = context ? context->cpu_sample_hz : DEFAULT_CPU_SAMPLE_HZ;
-    if (hz <= 0) hz = DEFAULT_CPU_SAMPLE_HZ;
-    period_us64 = (uint64_t)(1000000ULL / (uint64_t)hz);
-    hdr[3] = (uintptr_t)period_us64; /* sampling period in microseconds */
-    hdr[4] = (uintptr_t)0;         /* padding */
-    fwrite(hdr, sizeof(uintptr_t), 5, fp);
-
-    /* records: for each TLS sample write [count, depth, pcs...] with pcs leaf-first */
-    unsigned cap = C_RB_CAP;
-    for (unsigned i = 0; i < cap; ++i) {
-        c_sample_t* cs = &g_c_rb[i];
-        if (cs->depth == 0) continue;
-        uintptr_t count = (uintptr_t)1;
-        uintptr_t depth = (uintptr_t)cs->depth;
-        fwrite(&count, sizeof(uintptr_t), 1, fp);
-        fwrite(&depth, sizeof(uintptr_t), 1, fp);
-        /* leaf-first as stored: pcs[0]=ip, pcs[1]=caller,... */
-        for (uint16_t d = 0; d < cs->depth; ++d) {
-            uintptr_t pc = (uintptr_t)cs->pcs[d];
-            fwrite(&pc, sizeof(uintptr_t), 1, fp);
-        }
-    }
-
-    /* trailer: 0,1,0 */
-    uintptr_t tr[3];
-    tr[0] = (uintptr_t)0;
-    tr[1] = (uintptr_t)1;
-    tr[2] = (uintptr_t)0;
-    fwrite(tr, sizeof(uintptr_t), 3, fp);
-
-    /* append /proc/self/maps as text */
-    FILE* maps = fopen("/proc/self/maps", "r");
-    if (maps) {
-        char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), maps)) > 0) {
-            fwrite(buf, 1, n, fp);
-        }
-        fclose(maps);
-    }
-
-    fclose(fp);
-}
-
-static void clear_c_tls_samples(void) {
-    unsigned cap = C_RB_CAP;
-    for (unsigned i = 0; i < cap; ++i) {
-        g_c_rb[i].depth = 0;
-    }
-}
-
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -674,8 +464,6 @@ profile_create() {
     context->cs_map = imap_create();
     context->alloc_map = imap_create();
     context->symbol_map = imap_create();
-    context->sample_map = smap_create(2048);
-    context->c_sample_map = smap_create(2048);
     context->callpath = NULL;
     context->cur_cs = NULL;
     context->running_in_hook = false;
@@ -683,8 +471,6 @@ profile_create() {
     context->last_alloc_ud = NULL;
     context->cpu_mode = MODE_PROFILE;       // default: profile
     context->mem_mode = MODE_PROFILE;       // default: profile
-    context->cpu_sample_hz = DEFAULT_CPU_SAMPLE_HZ; // default: hz for sample
-    context->rng_state = 0;
     context->profile_cost_ns = 0;
     return context;
 }
@@ -725,15 +511,6 @@ profile_free(struct profile_context* context) {
     imap_free(context->cs_map);
     imap_dump(context->symbol_map, _ob_free_symbol, NULL);
     imap_free(context->symbol_map);
-    if (context->sample_map) {
-        // free smap entries' values (uint64_t*)
-        smap_iterate(context->sample_map, _free_counter_cb, NULL);
-        smap_free(context->sample_map);
-    }
-    if (context->c_sample_map) {
-        smap_iterate(context->c_sample_map, _free_counter_cb, NULL);
-        smap_free(context->c_sample_map);
-    }
     imap_dump(context->alloc_map, _ob_free_alloc_node, NULL);
     imap_free(context->alloc_map);
     pfree(context);
@@ -785,27 +562,6 @@ static void unset_profile_context(lua_State* L) {
     lua_pushlightuserdata(L, &profile_context_key);
     lua_pushnil(L);
     lua_rawset(L, LUA_REGISTRYINDEX);
-}
-
-// --- Random gap generator (exponential/geometric) ---
-static inline uint64_t xorshift64(uint64_t* s) {
-    uint64_t x = (*s) ? *s : 88172645463393265ULL;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *s = x;
-    return x;
-}
-
-static inline int next_exponential_gap(struct profile_context* ctx) {
-    // mean = ctx->cpu_sample_hz (instructions)
-    // u in (0,1], avoid 0
-    uint64_t r = xorshift64(&ctx->rng_state);
-    double u = ( (r >> 11) * (1.0 / 9007199254740992.0) ); // 53-bit to [0,1)
-    if (u <= 0.0) u = 1e-12;
-    int gap = (int)floor(-log(u) * (double)ctx->cpu_sample_hz);
-    if (gap < 1) gap = 1;
-    return gap;
 }
 
 static struct icallpath_context*
@@ -1314,8 +1070,7 @@ _lstart(lua_State* L) {
     // parse options: start([opts]), opts is a table
     int cpu_mode = MODE_PROFILE; // default profile
     int mem_mode = MODE_PROFILE; // default profile
-    int cpu_sample_hz = DEFAULT_CPU_SAMPLE_HZ;
-    bool read_ok = read_arg(L, &cpu_mode, &mem_mode, &cpu_sample_hz);
+    bool read_ok = read_arg(L, &cpu_mode, &mem_mode);
     if (!read_ok) {
         printf("start fail, invalid options\n");
         return 0;
@@ -1329,28 +1084,16 @@ _lstart(lua_State* L) {
     context->is_ready = true;
     context->cpu_mode = cpu_mode;
     context->mem_mode = mem_mode;
-    context->cpu_sample_hz = cpu_sample_hz;
-    // seed rng with time xor state pointer
-    context->rng_state = get_mono_ns() ^ (uint64_t)(uintptr_t)context;
-    
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
     if (mem_mode != MODE_OFF) {
         lua_setallocf(L, _hook_alloc, context);
     }
     set_profile_context(L, context);
 
-    if (cpu_mode == MODE_SAMPLE) {
-        g_prof_current_L = L;
-        lua_prof_set_cb_n(_on_prof_trap_n);        
-        if (start_thread_timer_hz(cpu_sample_hz) != 0) {
-            printf("start thread timer fail\n");
-        }
-    } else if (cpu_mode == MODE_PROFILE || mem_mode != MODE_OFF) {
-        _set_hook_all_co(L);
-    }
+    _set_hook_all_co(L);
     
     context->running_in_hook = false;
-    printf("luaprofile started, cpu_mode = %d, mem_mode = %d, cpu_sample_hz = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->cpu_sample_hz, context->last_alloc_ud);    
+    printf("luaprofile started, cpu_mode = %d, mem_mode = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->last_alloc_ud);    
     return 0;
 }
 
@@ -1369,11 +1112,6 @@ _lstop(lua_State* L) {
     unset_profile_context(L);
     profile_free(context);
     context = NULL;
-    // stop sampler
-    if (g_prof_timerid) {
-        stop_thread_timer();
-    }
-    g_prof_current_L = NULL;
     printf("luaprofile stopped\n");
     return 0;
 }
@@ -1392,7 +1130,6 @@ _lmark(lua_State* L) {
     if(context->is_ready) {
         lua_sethook(co, _hook_call, LUA_MASKCALL | LUA_MASKRET, 0);
     }
-    g_prof_current_L = co;
     lua_pushboolean(L, context->is_ready);
     return 1;
 }
@@ -1416,38 +1153,25 @@ static int
 _ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
-        /* fold C stack TLS buffer into c_sample_map using dladdr */
-        fold_c_tls_samples(context);
         // full gc
         lua_gc(L, LUA_GCCOLLECT, 0);
 
         // stop gc before dump
         int gc_was_running = _stop_gc_if_need(L); 
         context->running_in_hook = true;
+
         uint64_t cur_time = get_mono_ns();
         uint64_t profile_time = cur_time - context->start_time;
         lua_pushinteger(L, profile_time);
 
-        if (context->cpu_mode == MODE_SAMPLE) {
-            /* dump Lua folded stacks */
-            push_lua_folded_samples(L, context);
-            /* also write C stacks (names already resolved in keys) to a file */
-            write_c_samples_file(context, "cpu-c-samples.txt");
-            /* and emit raw addresses for offline symbolization */
-            write_c_samples_raw("cpu-c-samples.raw");
-            /* and emit legacy pprof file for pprof toolchain */
-            write_c_profile_pprof(context, "cpu-c-profile.pprof");
-            /* now it's safe to clear TLS buffer once */
-            clear_c_tls_samples();
+        // tracing dump
+        if (context->callpath) {
+            update_root_stat(context, L);
+            dump_call_path(context, L);
         } else {
-            // tracing dump
-            if (context->callpath) {
-                update_root_stat(context, L);
-                dump_call_path(context, L);
-            } else {
-                lua_newtable(L);
-            }
+            lua_newtable(L);
         }
+
         context->running_in_hook = false;
         _restart_gc_if_need(L, gc_was_running);
         return 2;
@@ -1458,118 +1182,6 @@ _ldump(lua_State* L) {
 static int _lget_mono_ns(lua_State* L) {
     lua_pushinteger(L, get_mono_ns());
     return 1;
-}
-
-// -------- CPU sampling (timer + trap callback) --------
-
-
-// Construct folded key and ensure symbol info
-/* Safe stack sampler: does NOT call Lua debug API; walks CallInfo chain */
-static void record_lua_sample_weight(lua_State* L, unsigned int weight) {
-    struct profile_context* context = get_profile_context(L);
-    if (!context || context->cpu_mode != MODE_SAMPLE || context->running_in_hook) return;
-    context->running_in_hook = true;
-    char keybuf[4096];
-    size_t kp = 0;
-    const void* protos[MAX_SAMPLE_DEPTH];
-    int nframes = 0;
-
-    /* 1) 遍历 CallInfo 链，采集自叶到根的 Proto/函数指针，并为每一帧写入符号信息（source/line，占位名） */
-    {
-        CallInfo* ci = L->ci;
-        while (ci && nframes < MAX_SAMPLE_DEPTH) {
-            const TValue* tv = s2v(ci->func.p);
-            const void* proto = NULL;
-            const Proto* lua_p = NULL;
-
-            if (ttislcf(tv)) {
-                proto = (const void*)fvalue(tv); /* 轻量 C 函数 */
-            } else if (ttisclosure(tv)) {
-                const Closure* cl = clvalue(tv);
-                if (cl->c.tt == LUA_VLCL) {
-                    lua_p = cl->l.p;            /* Lua 函数 */
-                    proto = (const void*)lua_p;
-                } else if (cl->c.tt == LUA_VCCL) {
-                    proto = (const void*)cl->c.f; /* C 闭包 */
-                }
-            }
-
-            if (proto) {
-                uint64_t sym_key = (uint64_t)((uintptr_t)proto);
-                struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
-                if (!si) {
-                    si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
-                    if (lua_p) {
-                        const char* src = lua_p->source ? getstr(lua_p->source) : "null";
-                        si->name = pstrdup("(lua)");
-                        si->source = pstrdup(src ? src : "null");
-                        si->line = lua_p->linedefined;
-                    } else {
-                        si->name = pstrdup("(C)");
-                        si->source = pstrdup("(C)");
-                        si->line = -1;
-                    }
-                    imap_set(context->symbol_map, sym_key, si);
-                }
-                protos[nframes++] = proto;
-            }
-            ci = ci->previous;
-        }
-    }
-
-    /* 2) 为每一帧按需补齐函数名：仅当缓存里是占位名时，才调用 debug API 获取 name */
-    {
-        lua_Debug ar;
-        for (int lvl = 0; lvl < nframes; ++lvl) {
-            uint64_t sk = (uint64_t)((uintptr_t)protos[lvl]);
-            struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sk);
-            if (si && si->name && si->name[0] != '(') {
-                continue; /* 缓存已有人类可读的函数名，跳过 */
-            }
-            if (!lua_getstack(L, lvl, &ar)) break;
-            int ok = lua_getinfo(L, "n", &ar);
-            if (ok && ar.name && ar.name[0]) {
-                if (!si) {
-                    si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
-                    si->source = pstrdup("unknown");
-                    si->line = -1;
-                    imap_set(context->symbol_map, sk, si);
-                } else if (si->name) {
-                    pfree(si->name);
-                }
-                si->name = pstrdup(ar.name);
-            }
-        }
-    }
-
-    // Build folded key as root->...->leaf (FlameGraph expected order)
-
-    for (int idx = nframes - 1; idx >= 0; --idx) {
-        char token[32];
-        int n = snprintf(token, sizeof(token), "%p", protos[idx]);
-        if (n > 0) {
-            if (kp + (size_t)n + 1 < sizeof(keybuf)) {
-                if (kp > 0) keybuf[kp++] = ';';
-                memcpy(keybuf + kp, token, (size_t)n);
-                kp += (size_t)n;
-            } else break;
-        }
-    }
-    keybuf[kp] = '\0';
-    if (kp > 0) {
-        uint64_t* cnt = (uint64_t*)smap_get(context->sample_map, keybuf);
-        if (!cnt) {
-            cnt = (uint64_t*)pmalloc(sizeof(uint64_t));
-            *cnt = 0;
-            smap_set(context->sample_map, keybuf, cnt);
-        }
-        (*cnt) += (uint64_t)(weight ? weight : 1);
-    }
-    context->running_in_hook = false;
-}
-
-static void _on_prof_trap_n(lua_State* L, unsigned int n) {
-    record_lua_sample_weight(L, n);
 }
 
 // sleep(seconds): 使用 POSIX nanosleep，支持小数秒，自动处理被信号打断
