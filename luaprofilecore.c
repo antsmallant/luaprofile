@@ -983,7 +983,7 @@ static void _restart_gc_if_need(lua_State* L, int gc_was_running) {
 }
 
 static int
-_lmark_all(lua_State* L) {
+lmark_all(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     if (!ctx) {
         printf("mark all co fail, profile not started\n");
@@ -1005,7 +1005,7 @@ _lmark_all(lua_State* L) {
 }
 
 static int 
-_lunmark_all(lua_State* L) {
+lunmark_all(lua_State* L) {
     struct profile_context* ctx = get_profile_context(L);
     if (!ctx) {
         printf("unhook all co fail, profile not started\n");
@@ -1027,7 +1027,7 @@ _lunmark_all(lua_State* L) {
 }
 
 static int
-_lstart(lua_State* L) {
+lstart(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context != NULL) {
         printf("start fail, profile already started\n");
@@ -1062,7 +1062,7 @@ _lstart(lua_State* L) {
 }
 
 static int
-_lstop(lua_State* L) {
+lstop(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("stop fail, profile not started\n");
@@ -1080,7 +1080,7 @@ _lstop(lua_State* L) {
 }
 
 static int
-_lmark(lua_State* L) {
+lmark(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("mark fail, profile not started\n");
@@ -1098,7 +1098,7 @@ _lmark(lua_State* L) {
 }
 
 static int
-_lunmark(lua_State* L) {
+lunmark(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context == NULL) {
         printf("unmark fail, profile not started\n");
@@ -1113,7 +1113,7 @@ _lunmark(lua_State* L) {
 }
 
 static int
-_ldump(lua_State* L) {
+ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
         // full gc to free objects, make mem profile more accurate
@@ -1142,13 +1142,13 @@ _ldump(lua_State* L) {
     return 0;
 }
 
-static int _lget_mono_ns(lua_State* L) {
+static int lget_mono_ns(lua_State* L) {
     lua_pushinteger(L, get_mono_ns());
     return 1;
 }
 
 // sleep(seconds): 使用 POSIX nanosleep，支持小数秒，自动处理被信号打断
-static int _lsleep(lua_State* L) {
+static int lsleep(lua_State* L) {
     lua_Number sec = luaL_checknumber(L, 1);
     if (sec < 0) sec = 0;
 
@@ -1175,15 +1175,15 @@ int
 luaopen_luaprofilecore(lua_State* L) {
     luaL_checkversion(L);
      luaL_Reg l[] = {
-        {"start", _lstart},
-        {"stop", _lstop},
-        {"mark", _lmark},
-        {"unmark", _lunmark},
-        {"mark_all", _lmark_all},
-        {"unmark_all", _lunmark_all},
-        {"dump", _ldump},
-        {"getnanosec", _lget_mono_ns},
-        {"sleep", _lsleep},
+        {"start", lstart},
+        {"stop", lstop},
+        {"mark", lmark},
+        {"unmark", lunmark},
+        {"mark_all", lmark_all},
+        {"unmark_all", lunmark_all},
+        {"dump", ldump},
+        {"getnanosec", lget_mono_ns},
+        {"sleep", lsleep},
         {NULL, NULL},
     };
     luaL_newlib(L, l);
