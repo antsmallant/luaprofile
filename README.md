@@ -2,7 +2,7 @@
 
 ```
 git clone https://github.com/antsmallant/luaprofile.git
-cd luaprofile && sh build.sh
+cd luaprofile && git submodule update --init && sh build.sh
 ```
 
 ---

@@ -1161,11 +1161,11 @@ static int lsleep(lua_State* L) {
 
     struct timespec req;
     req.tv_sec = (time_t)integral;
-    long nsec = (long)(frac * 1000000000.0);
+    long nsec = (long)(frac * 1.0 * NANOSEC);
     if (nsec < 0) nsec = 0;
-    if (nsec >= 1000000000L) {
+    if (nsec >= NANOSEC) {
         req.tv_sec += 1;
-        nsec -= 1000000000L;
+        nsec -= NANOSEC;
     }
     req.tv_nsec = nsec;
 
