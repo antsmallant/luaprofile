@@ -360,7 +360,6 @@ struct callpath_node {
     uint64_t last_ret_time;
     uint64_t call_count;
     uint64_t real_cost;
-    uint64_t cpu_samples;    // sampling count (leaf samples), aggregated at dump
     uint64_t alloc_bytes;
     uint64_t free_bytes;
     uint64_t alloc_times;
@@ -390,7 +389,6 @@ callpath_node_create() {
     node->last_ret_time = 0;
     node->call_count = 0;
     node->real_cost = 0;
-    node->cpu_samples = 0;
     node->alloc_bytes = 0;
     node->free_bytes = 0;
     node->alloc_times = 0;
