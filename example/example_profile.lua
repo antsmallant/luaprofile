@@ -16,16 +16,15 @@ local function print_ts(...)
     io.stdout:write("[" .. ts .. "] ", table.concat(parts, "\t"), "\n")
 end
 
-local function write_profile_result(str)
-    local fp = "./example_result.json"
-    local file, err = io.open(fp, "w")
+local function write_profile_result(filepath, str)
+    local file, err = io.open(filepath, "w")
     if not file then
         io.stderr:write("open file failed: " .. tostring(err) .. "\n")
         return false
     end
     file:write(str, "\n")
     file:close()
-    print_ts("write profile result to " .. fp)
+    print_ts("write profile result to " .. filepath)
     return true
 end
 
@@ -85,6 +84,7 @@ end
 
 local function test_with_profile()
     print_ts("test_with_profile start")
+    local resultfile = "./example_result.json"
     local opts = { mem_profile = "on" } -- 控制是否开启内存 profile
     profile.start(opts)
     local t1 = c.getnanosec()
@@ -92,7 +92,7 @@ local function test_with_profile()
     local t2 = c.getnanosec()
     local result = profile.stop()
     local strResult = json.encode(result)
-    write_profile_result(strResult)
+    write_profile_result(resultfile, strResult)
     print_ts("test_with_profile stop")
     return t2 - t1
 end
