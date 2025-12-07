@@ -998,8 +998,10 @@ lstart(lua_State* L) {
         return 0;
     }
 
-    // full gc before start
-    lua_gc(L, LUA_GCCOLLECT, 0);  
+    // full gc before start, make mem profile more accurate
+    if (MODE_ON == mem_profile_mode) {
+        lua_gc(L, LUA_GCCOLLECT, 0);  
+    }
 
     context = profile_create();
     context->running_in_hook = true;
@@ -1011,8 +1013,8 @@ lstart(lua_State* L) {
         lua_setallocf(L, _hook_alloc, context);
     }
     set_profile_context(L, context);
-    
     context->running_in_hook = false;
+    
     printf("luaprofile started, mem_profile_mode = %d, last_alloc_ud = %p\n", context->mem_profile_mode, context->last_alloc_ud);    
     return 0;
 }
@@ -1117,15 +1119,17 @@ ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
         // full gc to free objects, make mem profile more accurate
-        lua_gc(L, LUA_GCCOLLECT, 0);
+        if (MODE_ON ==context->mem_profile_mode) {
+            lua_gc(L, LUA_GCCOLLECT, 0);
+        }
 
         // stop gc before dump
         int gc_was_running = _stop_gc_if_need(L); 
         context->running_in_hook = true;
 
         uint64_t cur_time = get_mono_ns();
-        uint64_t profile_time = cur_time - context->start_time;
-        lua_pushinteger(L, profile_time);
+        double profile_duration = (cur_time - context->start_time)*1.0/NANOSEC;
+        lua_pushnumber(L, profile_duration);
 
         // tracing dump
         if (context->callpath) {

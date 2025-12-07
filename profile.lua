@@ -41,11 +41,11 @@ function M.stop()
     end
     coroutine.create = old_co_create
     coroutine.wrap = old_co_wrap    
-    local record_time, nodes = c.dump()
+    local duration_seconds, nodes = c.dump()
     c.unmark_all()
     c.stop()
     g_profile_started = false
-    return {time = record_time, nodes = nodes}
+    return {duration_seconds = duration_seconds, nodes = nodes}
 end
 
 return M
