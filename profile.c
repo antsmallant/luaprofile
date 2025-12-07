@@ -1,22 +1,21 @@
 // This file is modified version from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile
 
-#include "profile.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <time.h> 
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <errno.h>
 #include "lobject.h"
 #include "lfunc.h"
 #include "lstate.h"
 #include "lua.h"
 #include "lauxlib.h"
-#include <pthread.h>
-#include <stdint.h>
-#include <string.h>
-#include <math.h>
-#include <time.h>
-#include <errno.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <sys/ucontext.h>
-#include <dlfcn.h>
+
 
 /*
 callpath node 构成一棵树，每个frame可以在这个树中找到一个 node。framestack 从 root frame 到 cur frame, 对应这棵树的某条路径。  
@@ -30,6 +29,10 @@ node1
     node31
 对应着 frame1 -> frame2 -> frame3 的调用关系。 
 */
+#define prealloc  realloc
+#define pmalloc   malloc
+#define pfree  free
+#define pcalloc calloc
 
 #define MAX_CALL_SIZE               1024
 #define MAX_CO_SIZE                 1024
