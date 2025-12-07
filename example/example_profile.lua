@@ -87,14 +87,11 @@ local function test_with_profile()
     local resultfile = "./example_result.json"
     local opts = { mem_profile = "on" } -- 控制是否开启内存 profile
     profile.start(opts)
-    local t1 = c.getnanosec()
     do_test1()
-    local t2 = c.getnanosec()
     local result = profile.stop()
     local strResult = json.encode(result)
     write_profile_result(resultfile, strResult)
     print_ts("test_with_profile stop")
-    return t2 - t1
 end
 
 test_with_profile()
