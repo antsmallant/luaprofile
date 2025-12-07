@@ -1,6 +1,6 @@
 /*
-This file is modified from https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
-And the original version is this : https://github.com/lvzixun/luaprofile .
+Modified from: https://github.com/JieTrancender/game-server/tree/main/3rd/luaprofile .
+The original version is : https://github.com/lvzixun/luaprofile .
 
 */
 

@@ -19,7 +19,7 @@ end
 local g_storage = {}
 
 local function write_profile_result(str)
-    local file, err = io.open(root .. "profile_result.txt", "a")
+    local file, err = io.open(root .. "example_result.json", "w")
     if not file then
         io.stderr:write("open file failed: " .. tostring(err) .. "\n")
         return false
@@ -117,15 +117,4 @@ local function test_with_profile()
     return t2 - t1
 end
 
-local function test_without_profile()
-    local t1 = c.getnanosec()
-    do_test()
-    local t2 = c.getnanosec()
-    return t2 - t1
-end
-
-local cost_without_profile = test_without_profile()
-local cost_with_profile = test_with_profile()
-print("test_with_profile cost:", cost_with_profile)
-print("test_without_profile cost:", cost_without_profile)
-print("test_with_profile cost / test_without_profile cost:", cost_with_profile / cost_without_profile)
+test_with_profile()
