@@ -21,14 +21,14 @@ end
 
 local g_profile_started = false
 
--- opts = { cpu = "on|off, mem = "on|off" }
+-- opts = { mem_profile = "off|on" }
 function M.start(opts)
     if g_profile_started then
         print("profile start fail, already started")
         return
     end
     g_profile_started = true
-    c.start(opts or { cpu = "on", mem = "on" })
+    c.start(opts)
     c.mark_all()
     coroutine.create = my_coroutine_create
     coroutine.wrap = my_coroutine_wrap

@@ -293,27 +293,19 @@ get_realtime_ns() {
 }
 #endif
 
-// 读取启动参数：{ cpu = "off|on", mem = "off|on" }
+// 读取启动参数：{ mem_profile = "off|on" }
 static bool
-read_arg(lua_State* L, int* out_cpu_mode, int* out_mem_mode) {
-    if (!out_cpu_mode || !out_mem_mode) return false;
+read_arg(lua_State* L, int* out_mem_profile) {
+    if (!out_mem_profile) return false;
     if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
 
-    lua_getfield(L, 1, "cpu");
+    // 是否启用 内存 profile
+    lua_getfield(L, 1, "mem_profile");
     if (lua_isstring(L, -1)) {
         const char* s = lua_tostring(L, -1);
-        if (strcmp(s, "off") == 0) *out_cpu_mode = MODE_OFF;
-        else if (strcmp(s, "on") == 0) *out_cpu_mode = MODE_ON;
-        else {printf("invalid cpu mode: %s\n", s); return false;}
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "mem");
-    if (lua_isstring(L, -1)) {
-        const char* s = lua_tostring(L, -1);
-        if (strcmp(s, "off") == 0) *out_mem_mode = MODE_OFF;
-        else if (strcmp(s, "on") == 0) *out_mem_mode = MODE_ON;
-        else {printf("invalid mem mode: %s\n", s); return false;}
+        if (strcmp(s, "off") == 0) *out_mem_profile = MODE_OFF;
+        else if (strcmp(s, "on") == 0) *out_mem_profile = MODE_ON;
+        else {printf("invalid mem_profile mode: %s\n", s); return false;}
     }
     lua_pop(L, 1);
 
@@ -346,8 +338,7 @@ struct profile_context {
     struct imap_context*        symbol_map;
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
-    int         cpu_mode;       // MODE_*
-    int         mem_mode;       // MODE_*
+    int         mem_profile_mode;       // MODE_*
     uint64_t    profile_cost_ns;
 };
 
@@ -459,8 +450,7 @@ profile_create() {
     context->running_in_hook = false;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
-    context->cpu_mode = MODE_ON;
-    context->mem_mode = MODE_ON;
+    context->mem_profile_mode = MODE_OFF;
     context->profile_cost_ns = 0;
     return context;
 }
@@ -894,26 +884,24 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     lua_pushinteger(arg->L, node->last_ret_time);
     lua_setfield(arg->L, -2, "last_ret_time");
+    
+    lua_pushinteger(arg->L, call_count);
+    lua_setfield(arg->L, -2, "call_count");
 
-    if (arg->pcontext->cpu_mode == MODE_ON) {
-        lua_pushinteger(arg->L, call_count);
-        lua_setfield(arg->L, -2, "call_count");
+    lua_pushinteger(arg->L, real_cost);
+    lua_setfield(arg->L, -2, "cpu_cost_ns");
 
-        lua_pushinteger(arg->L, real_cost);
-        lua_setfield(arg->L, -2, "cpu_cost_ns");
-
-        uint64_t parent_real_cost = 0;
-        if (node->parent) {
-            parent_real_cost = node->parent->real_cost;
-        }
-        double percent = parent_real_cost > 0 ? ((double)real_cost / parent_real_cost * 100.0) : 100;
-        char percent_str[32] = {0};
-        snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
-        lua_pushstring(arg->L, percent_str);
-        lua_setfield(arg->L, -2, "cpu_cost_percent");
+    uint64_t parent_real_cost = 0;
+    if (node->parent) {
+        parent_real_cost = node->parent->real_cost;
     }
+    double percent = parent_real_cost > 0 ? ((double)real_cost / parent_real_cost * 100.0) : 100;
+    char percent_str[32] = {0};
+    snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
+    lua_pushstring(arg->L, percent_str);
+    lua_setfield(arg->L, -2, "cpu_cost_percent");
 
-    if (arg->pcontext->mem_mode == MODE_ON) {
+    if (MODE_ON == arg->pcontext->mem_profile_mode) {
         lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
         lua_setfield(arg->L, -2, "alloc_bytes");
 
@@ -1047,9 +1035,8 @@ _lstart(lua_State* L) {
     }
 
     // parse options: start([opts]), opts is a table
-    int cpu_mode = MODE_ON;  // default 
-    int mem_mode = MODE_ON;  // default
-    bool read_ok = read_arg(L, &cpu_mode, &mem_mode);
+    int mem_profile_mode = MODE_OFF;  // default
+    bool read_ok = read_arg(L, &mem_profile_mode);
     if (!read_ok) {
         printf("start fail, invalid options\n");
         return 0;
@@ -1062,16 +1049,15 @@ _lstart(lua_State* L) {
     context->running_in_hook = true;
     context->start_time = get_mono_ns();
     context->is_ready = true;
-    context->cpu_mode = cpu_mode;
-    context->mem_mode = mem_mode;
+    context->mem_profile_mode = mem_profile_mode;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    if (MODE_ON == mem_mode) {
+    if (MODE_ON == mem_profile_mode) {
         lua_setallocf(L, _hook_alloc, context);
     }
     set_profile_context(L, context);
     
     context->running_in_hook = false;
-    printf("luaprofile started, cpu_mode = %d, mem_mode = %d, last_alloc_ud = %p\n", context->cpu_mode, context->mem_mode, context->last_alloc_ud);    
+    printf("luaprofile started, mem_profile_mode = %d, last_alloc_ud = %p\n", context->mem_profile_mode, context->last_alloc_ud);    
     return 0;
 }
 

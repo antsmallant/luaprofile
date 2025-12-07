@@ -85,7 +85,7 @@ end
 
 local function test_with_profile()
     print_ts("test_with_profile start")
-    local opts = { mem = "on" } -- 控制是否开启内存 profile
+    local opts = { mem_profile = "on" } -- 控制是否开启内存 profile
     profile.start(opts)
     local t1 = c.getnanosec()
     do_test1()
