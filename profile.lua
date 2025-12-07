@@ -20,6 +20,7 @@ local function my_coroutine_wrap(f)
 end
 
 local g_profile_started = false
+local g_profile_start_time
 
 -- opts = { mem_profile = "off|on" }
 function M.start(opts)
@@ -28,6 +29,7 @@ function M.start(opts)
         return
     end
     g_profile_started = true
+    g_profile_start_time = os.time()
     c.start(opts)
     c.mark_all()
     coroutine.create = my_coroutine_create
@@ -45,7 +47,8 @@ function M.stop()
     c.unmark_all()
     c.stop()
     g_profile_started = false
-    return {duration_seconds = duration_seconds, nodes = nodes}
+    local start_time = os.date("%Y-%m-%d %H:%M:%S", g_profile_start_time)
+    return {start_time = start_time, duration_seconds = duration_seconds, nodes = nodes}
 end
 
 return M
