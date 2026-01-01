@@ -83,7 +83,7 @@ end
 
 local function test_with_profile()
     print_ts("test_with_profile start")
-    local resultfile = "./example_result.json"
+    local resultfile = "./output_of_example.json"
     local opts = { mem_profile = "off" } -- 控制是否开启内存 profile
     lpaux.start(opts)
     do_test1()
