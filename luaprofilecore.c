@@ -32,8 +32,10 @@ Check https://github.com/antsmallant/luaprofile for more.
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
-#define MODE_OFF                    0
-#define MODE_ON                     1
+enum PROFILE_MODE {
+    PROFILE_MODE_OFF,
+    PROFILE_MODE_ON,
+};
 
 #define DEFAULT_IMAP_SLOT_SIZE      1024
 
@@ -303,8 +305,8 @@ read_arg(lua_State* L, int* out_mem_profile) {
     lua_getfield(L, 1, "mem_profile");
     if (lua_isstring(L, -1)) {
         const char* s = lua_tostring(L, -1);
-        if (strcmp(s, "off") == 0) *out_mem_profile = MODE_OFF;
-        else if (strcmp(s, "on") == 0) *out_mem_profile = MODE_ON;
+        if (strcmp(s, "off") == 0) *out_mem_profile = PROFILE_MODE_OFF;
+        else if (strcmp(s, "on") == 0) *out_mem_profile = PROFILE_MODE_ON;
         else {printf("invalid mem_profile mode: %s\n", s); return false;}
     }
     lua_pop(L, 1);
@@ -339,7 +341,7 @@ struct profile_context {
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
     int         mem_profile_mode;       // MODE_*
-    uint64_t    profile_cost;  // profiling logic cost (in nanoseconds)
+    uint64_t    profile_extra_cpu_cost;  // profiling logic cost (in nanoseconds)
 };
 
 struct callpath_node {
@@ -450,8 +452,8 @@ profile_create() {
     context->running_in_hook = false;
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
-    context->mem_profile_mode = MODE_OFF;
-    context->profile_cost = 0;
+    context->mem_profile_mode = PROFILE_MODE_OFF;
+    context->profile_extra_cpu_cost = 0;
     return context;
 }
 
@@ -646,6 +648,7 @@ end
 */
 static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
     const void* proto = NULL;
+
     if (ar->i_ci && ar->i_ci->func.p) {
         const TValue* tv = s2v(ar->i_ci->func.p);
         if (ttislcf(tv)) {
@@ -659,13 +662,15 @@ static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
             }
         }
     }
+
+    // 兜底
     if (!proto) {
-        // 兜底：仍可能遇到少数拿不到 TValue 的情况
         lua_getinfo(L, "f", ar);
         proto = lua_topointer(L, -1);
         lua_pop(L, 1);
         printf("get prototype by getinfo: %p\n", proto);
     }
+
     return proto;
 }
 
@@ -682,7 +687,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
     size_t newsize = _nsize;
 
     if (oldsize == 0 && newsize > 0) {
-        // alloc
+        // 1、alloc
 
         // 更新节点
         struct callpath_node* leaf = _current_leaf_node(context);
@@ -696,7 +701,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
 
     } else if (oldsize > 0 && newsize == 0) {
-        // free
+        // 2、free
         
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
@@ -711,7 +716,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         }
 
     } else if (oldsize > 0 && newsize > 0) {
-        // realloc
+        // 3、realloc
         
         // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
         // 1、旧 node，free_bytes 加上 oldsize；
@@ -830,7 +835,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
         } while(tail_call);
     }
 
-    context->profile_cost += (get_mono_ns() - begin_time);
+    context->profile_extra_cpu_cost += (get_mono_ns() - begin_time);
     context->running_in_hook = false;
 }
 
@@ -901,7 +906,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushstring(arg->L, percent_str);
     lua_setfield(arg->L, -2, "cpu_cost(%)");
 
-    if (MODE_ON == arg->pcontext->mem_profile_mode) {
+    if (PROFILE_MODE_ON == arg->pcontext->mem_profile_mode) {
         lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
         lua_setfield(arg->L, -2, "alloc_bytes");
 
@@ -922,8 +927,8 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 
     if (path == arg->pcontext->callpath) {
-        lua_pushinteger(arg->L, arg->pcontext->profile_cost);
-        lua_setfield(arg->L, -2, "profile_cost(ns)");
+        lua_pushinteger(arg->L, arg->pcontext->profile_extra_cpu_cost);
+        lua_setfield(arg->L, -2, "profile_extra_cpu_cost(ns)");
     }
 }
 
@@ -990,7 +995,7 @@ lstart(lua_State* L) {
     }
 
     // parse options: start([opts]), opts is a table
-    int mem_profile_mode = MODE_OFF;  // default
+    int mem_profile_mode = PROFILE_MODE_OFF;  // default
     bool read_ok = read_arg(L, &mem_profile_mode);
     if (!read_ok) {
         printf("start fail, invalid options\n");
@@ -998,7 +1003,7 @@ lstart(lua_State* L) {
     }
 
     // full gc before start, make mem profile more accurate
-    if (MODE_ON == mem_profile_mode) {
+    if (PROFILE_MODE_ON == mem_profile_mode) {
         lua_gc(L, LUA_GCCOLLECT, 0);  
     }
 
@@ -1008,7 +1013,7 @@ lstart(lua_State* L) {
     context->is_ready = true;
     context->mem_profile_mode = mem_profile_mode;
     context->last_alloc_f = lua_getallocf(L, &context->last_alloc_ud);
-    if (MODE_ON == mem_profile_mode) {
+    if (PROFILE_MODE_ON == mem_profile_mode) {
         lua_setallocf(L, _hook_alloc, context);
     }
     set_profile_context(L, context);
@@ -1118,7 +1123,7 @@ ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
         // full gc to free objects, make mem profile more accurate
-        if (MODE_ON ==context->mem_profile_mode) {
+        if (PROFILE_MODE_ON ==context->mem_profile_mode) {
             lua_gc(L, LUA_GCCOLLECT, 0);
         }
 
