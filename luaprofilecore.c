@@ -825,7 +825,9 @@ _hook_call(lua_State* L, lua_Debug* far) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
             ++node->call_count;
         }
-        frame->call_time = get_mono_ns();
+        uint64_t now_time = get_mono_ns();
+        frame->call_time = now_time;
+        context->profile_extra_cpu_cost += (now_time - begin_time);
 
     } else if (event == LUA_HOOKRET) {
         if (cs->top <= 0) {
@@ -836,18 +838,20 @@ _hook_call(lua_State* L, lua_Debug* far) {
         do {
             struct call_frame* cur_frame = pop_callframe(cs);
             struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
-            uint64_t total_cost = begin_time - cur_frame->call_time;
-            uint64_t cpu_cost = total_cost - cur_frame->co_cost;
-            assert(begin_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
+            uint64_t total_cpu_cost = begin_time - cur_frame->call_time;
+            uint64_t actual_cpu_cost = total_cpu_cost - cur_frame->co_cost;
+            assert(begin_time >= cur_frame->call_time && total_cpu_cost >= cur_frame->co_cost);
             cur_path->last_ret_time = begin_time;
-            cur_path->cpu_cost += cpu_cost;
+            cur_path->cpu_cost += actual_cpu_cost;
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
         } while(tail_call);
+
+        uint64_t now_time = get_mono_ns();
+        context->profile_extra_cpu_cost += (now_time - begin_time);
     }
 
-    context->profile_extra_cpu_cost += (get_mono_ns() - begin_time);
     context->running_in_hook = false;
 }
 
