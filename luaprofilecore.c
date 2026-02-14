@@ -663,12 +663,8 @@ static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
         }
     }
 
-    // 兜底
     if (!proto) {
-        lua_getinfo(L, "f", ar);
-        proto = lua_topointer(L, -1);
-        lua_pop(L, 1);
-        printf("get prototype by getinfo: %p\n", proto);
+        printf("ERROR: get prototype fail.\n");
     }
 
     return proto;
