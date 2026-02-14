@@ -28,7 +28,7 @@ Check https://github.com/antsmallant/luaprofile for more.
 #define pcalloc   calloc
 
 #define MAX_CALL_SIZE               1024
-#define MAX_CO_SIZE                 1024
+#define MAX_CO_SIZE                 10240
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
 
@@ -339,7 +339,7 @@ struct profile_context {
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
     int         mem_profile_mode;       // MODE_*
-    uint64_t    profile_cost_ns;
+    uint64_t    profile_cost;  // profiling logic cost (in nanoseconds)
 };
 
 struct callpath_node {
@@ -350,7 +350,7 @@ struct callpath_node {
     int     depth;
     uint64_t last_ret_time;
     uint64_t call_count;
-    uint64_t real_cost;
+    uint64_t cpu_cost;
     uint64_t alloc_bytes;
     uint64_t free_bytes;
     uint64_t alloc_times;
@@ -379,7 +379,7 @@ callpath_node_create() {
     node->depth = 0;
     node->last_ret_time = 0;
     node->call_count = 0;
-    node->real_cost = 0;
+    node->cpu_cost = 0;
     node->alloc_bytes = 0;
     node->free_bytes = 0;
     node->alloc_times = 0;
@@ -418,12 +418,12 @@ static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct prof
     arg->realloc_times_sum = 0;
 }
 
-struct sum_root_stat_arg {
-    uint64_t real_cost_sum;
+struct sum_parent_stat_arg {
+    uint64_t cpu_cost_sum;
 };
 
-static void _init_sum_root_stat_arg(struct sum_root_stat_arg* arg) {
-    arg->real_cost_sum = 0;
+static void _init_sum_parent_stat_arg(struct sum_parent_stat_arg* arg) {
+    arg->cpu_cost_sum = 0;
 }
 
 static inline char*
@@ -451,7 +451,7 @@ profile_create() {
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     context->mem_profile_mode = MODE_OFF;
-    context->profile_cost_ns = 0;
+    context->profile_cost = 0;
     return context;
 }
 
@@ -567,7 +567,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         node->parent = path_parent;
         node->depth = path_parent->depth + 1;
         node->last_ret_time = 0;
-        node->real_cost = 0;
+        node->cpu_cost = 0;
         node->call_count = 0;
         cur_path = icallpath_add_child(pre_path, k, node);
     }
@@ -820,17 +820,17 @@ _hook_call(lua_State* L, lua_Debug* far) {
             struct call_frame* cur_frame = pop_callframe(cs);
             struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
             uint64_t total_cost = begin_time - cur_frame->call_time;
-            uint64_t real_cost = total_cost - cur_frame->co_cost;
+            uint64_t cpu_cost = total_cost - cur_frame->co_cost;
             assert(begin_time >= cur_frame->call_time && total_cost >= cur_frame->co_cost);
             cur_path->last_ret_time = begin_time;
-            cur_path->real_cost += real_cost;
+            cur_path->cpu_cost += cpu_cost;
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
         } while(tail_call);
     }
 
-    context->profile_cost_ns += (get_mono_ns() - begin_time);
+    context->profile_cost += (get_mono_ns() - begin_time);
     context->running_in_hook = false;
 }
 
@@ -865,7 +865,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
 
     // 本节点的其他指标
-    uint64_t real_cost = node->real_cost;
+    uint64_t cpu_cost = node->cpu_cost;
     uint64_t call_count = node->call_count;
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
@@ -888,18 +888,18 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, call_count);
     lua_setfield(arg->L, -2, "call_count");
 
-    lua_pushinteger(arg->L, real_cost);
-    lua_setfield(arg->L, -2, "cpu_cost_ns");
+    lua_pushinteger(arg->L, cpu_cost);
+    lua_setfield(arg->L, -2, "cpu_cost(ns)");
 
-    uint64_t parent_real_cost = 0;
+    uint64_t parent_cpu_cost = 0;
     if (node->parent) {
-        parent_real_cost = node->parent->real_cost;
+        parent_cpu_cost = node->parent->cpu_cost;
     }
-    double percent = parent_real_cost > 0 ? ((double)real_cost / parent_real_cost * 100.0) : 100;
+    double percent = parent_cpu_cost > 0 ? ((double)cpu_cost / parent_cpu_cost * 100.0) : 100;
     char percent_str[32] = {0};
     snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
     lua_pushstring(arg->L, percent_str);
-    lua_setfield(arg->L, -2, "cpu_cost_percent");
+    lua_setfield(arg->L, -2, "cpu_cost(%)");
 
     if (MODE_ON == arg->pcontext->mem_profile_mode) {
         lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
@@ -922,30 +922,29 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     }
 
     if (path == arg->pcontext->callpath) {
-        lua_pushinteger(arg->L, arg->pcontext->profile_cost_ns);
-        lua_setfield(arg->L, -2, "profile_cost_ns");
+        lua_pushinteger(arg->L, arg->pcontext->profile_cost);
+        lua_setfield(arg->L, -2, "profile_cost(ns)");
     }
 }
 
-static void sum_root_stat(uint64_t key, void* value, void* ud) {
-    struct sum_root_stat_arg* arg = (struct sum_root_stat_arg*)ud;
+static void _sum_parent_stat(uint64_t key, void* value, void* ud) {
+    struct sum_parent_stat_arg* arg = (struct sum_parent_stat_arg*)ud;
     struct icallpath_context* path = (struct icallpath_context*)value;
     struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
-    arg->real_cost_sum += node->real_cost;
+    arg->cpu_cost_sum += node->cpu_cost;
 }
 
-static void update_root_stat(struct profile_context* pcontext, lua_State* L) {
+static void update_parent_stat(struct profile_context* pcontext, lua_State* L) {
     struct icallpath_context* path = pcontext->callpath;
     if (!path) return;
-    struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(path);
-    if (!root) return;
+    struct callpath_node* parent = (struct callpath_node*)icallpath_getvalue(path);
+    if (!parent) return;
 
-    root->last_ret_time = get_mono_ns();
     if (icallpath_children_size(path) > 0) {
-        struct sum_root_stat_arg arg;
-        _init_sum_root_stat_arg(&arg);
-        icallpath_dump_children(path, sum_root_stat, &arg);
-        root->real_cost = arg.real_cost_sum;
+        struct sum_parent_stat_arg arg;
+        _init_sum_parent_stat_arg(&arg);
+        icallpath_dump_children(path, _sum_parent_stat, &arg);
+        parent->cpu_cost = arg.cpu_cost_sum;
     }
 }
 
@@ -1133,7 +1132,7 @@ ldump(lua_State* L) {
 
         // tracing dump
         if (context->callpath) {
-            update_root_stat(context, L);
+            update_parent_stat(context, L);
             dump_call_path(context, L);
         } else {
             lua_newtable(L);
