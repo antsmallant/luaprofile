@@ -438,6 +438,42 @@ pstrdup(const char* s) {
     return d;
 }
 
+static struct symbol_info*
+get_symbol_info(lua_State* co, lua_Debug* far, uint64_t sym_key, struct imap_context* symbol_map) {
+    struct symbol_info* si = (struct symbol_info*)imap_query(symbol_map, sym_key);
+    if (si) return si;
+
+    lua_getinfo(co, "nSl", far);
+    const char* name = far->name;
+    int line = far->linedefined;
+    const char* source = far->source;
+    char flag = far->what[0];
+    if (flag == 'C') {
+        lua_Debug ar2;
+        int i = 0;
+        int ret = 0;
+        do {
+            i++;
+            ret = lua_getstack(co, i, &ar2);
+            if (ret) {
+                lua_getinfo(co, "Sl", &ar2);
+                if (ar2.what[0] != 'C') {
+                    line = ar2.currentline;
+                    source = ar2.source;
+                    break;
+                }
+            }
+        } while (ret);
+    }
+
+    si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
+    si->name = pstrdup(name ? name : "null");
+    si->source = pstrdup(source ? source : "null");
+    si->line = line;
+    imap_set(symbol_map, sym_key, si);
+    return si;
+}
+
 static struct profile_context *
 profile_create() {
     struct profile_context* context = (struct profile_context*)pmalloc(sizeof(*context));
@@ -577,36 +613,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
     struct callpath_node* cur_node = (struct callpath_node*)icallpath_getvalue(cur_path);
     if (cur_node->name == NULL) {
         uint64_t sym_key = (uint64_t)((uintptr_t)cur_cf->prototype);
-        struct symbol_info* si = (struct symbol_info*)imap_query(context->symbol_map, sym_key);
-        if (!si) {
-            lua_getinfo(co, "nSl", far);
-            const char* name = far->name;
-            int line = far->linedefined;
-            const char* source = far->source;
-            char flag = far->what[0];
-            if (flag == 'C') {
-                lua_Debug ar2;
-                int i=0;
-                int ret = 0;
-                do {
-                    i++;
-                    ret = lua_getstack(co, i, &ar2);
-                    if(ret) {
-                        lua_getinfo(co, "Sl", &ar2);
-                        if(ar2.what[0] != 'C') {
-                            line = ar2.currentline;
-                            source = ar2.source;
-                            break;
-                        }
-                    }
-                } while(ret);
-            }
-            si = (struct symbol_info*)pmalloc(sizeof(struct symbol_info));
-            si->name = pstrdup(name ? name : "null");
-            si->source = pstrdup(source ? source : "null");
-            si->line = line;
-            imap_set(context->symbol_map, sym_key, si);
-        }
+        struct symbol_info* si = get_symbol_info(co, far, sym_key, context->symbol_map);
         cur_node->name = si->name;
         cur_node->source = si->source;
         cur_node->line = si->line;
@@ -714,6 +721,7 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // 3、realloc
         
         // 参照 gperftools 的逻辑，realloc 拆分为 free 和 alloc 两个事件，但此处为了反映 gc 的压力，不增加 alloc_times 和 free_times。
+        // (旧 node 和新 node 可能是同一个 node)
         // 1、旧 node，free_bytes 加上 oldsize；
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1；
 
@@ -734,14 +742,16 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         if (leaf) {
             _mem_update_on_path(leaf, newsize, 0, 0, 0, 1);
         }
-        // 更新映射（搬移或原地）
-        if (alloc_ret != ptr && alloc_ret != NULL) {
+        // 更新映射
+        if (alloc_ret != ptr) {
+            // 搬移
             struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (!an) an = alloc_node_create();
             an->live_bytes = newsize;
             an->path = leaf;
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
         } else {
+            // 原地
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             bool exists = (an != NULL);
             if (!exists) an = alloc_node_create();
