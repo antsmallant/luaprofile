@@ -685,15 +685,16 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
     if (oldsize == 0 && newsize > 0) {
         // 1、alloc
 
-        // 更新节点
         struct callpath_node* leaf = _current_leaf_node(context);
-        if (leaf) _mem_update_on_path(leaf, newsize, 1, 0, 0, 0);
-
+        // 更新节点
+        if (leaf) {
+            _mem_update_on_path(leaf, newsize, 1, 0, 0, 0);
+        }
         // 创建映射
         struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret);
         if (an == NULL) an = alloc_node_create();
         an->live_bytes = newsize;
-        an->path = _current_leaf_node(context);
+        an->path = leaf;
         imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
 
     } else if (oldsize > 0 && newsize == 0) {
@@ -702,10 +703,8 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (an) {
             // 更新节点
-            size_t sub_bytes = an->live_bytes; 
-            uint64_t sub_times = (an->live_bytes ? 1 : 0);
             if (an->path && an->live_bytes > 0) {
-                _mem_update_on_path(an->path, 0, 0, sub_bytes, sub_times, 0);
+                _mem_update_on_path(an->path, 0, 0, an->live_bytes, 1, 0);
             }
             pfree(an);
             an = NULL;
@@ -718,6 +717,11 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
         // 1、旧 node，free_bytes 加上 oldsize；
         // 2、新 node，alloc_bytes 加上 newsize，realloc_times 加 1；
 
+        // realloc 失败（返回 NULL）时，旧指针仍然有效，不能更新统计或映射
+        if (alloc_ret == NULL) {
+            return alloc_ret;
+        }
+
         // 旧路径
         struct alloc_node* old_an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
         if (old_an && old_an->path) {
@@ -726,21 +730,23 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
 
         // 新路径
         struct callpath_node* leaf = _current_leaf_node(context);
-        if (leaf) _mem_update_on_path(leaf, newsize, 0, 0, 0, 1);
-
+        // 更新节点
+        if (leaf) {
+            _mem_update_on_path(leaf, newsize, 0, 0, 0, 1);
+        }
         // 更新映射（搬移或原地）
         if (alloc_ret != ptr && alloc_ret != NULL) {
             struct alloc_node* an = (struct alloc_node*)imap_remove(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             if (!an) an = alloc_node_create();
             an->live_bytes = newsize;
-            an->path = _current_leaf_node(context);
+            an->path = leaf;
             imap_set(context->alloc_map, (uint64_t)(uintptr_t)alloc_ret, an);
         } else {
             struct alloc_node* an = (struct alloc_node*)imap_query(context->alloc_map, (uint64_t)(uintptr_t)ptr);
             bool exists = (an != NULL);
             if (!exists) an = alloc_node_create();
             an->live_bytes = newsize;
-            an->path = _current_leaf_node(context);
+            an->path = leaf;
             if (!exists) imap_set(context->alloc_map, (uint64_t)(uintptr_t)ptr, an);
         }
     }
