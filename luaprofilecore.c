@@ -407,6 +407,9 @@ struct dump_call_path_arg {
     uint64_t alloc_times_sum;
     uint64_t free_times_sum;
     uint64_t realloc_times_sum;
+    uint64_t cpu_cost_sum_raw;
+    uint64_t cpu_cost_sum_adj;
+    double avg_profile_cost_per_call;
 };
 
 static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct profile_context* pcontext, lua_State* L) {
@@ -418,6 +421,9 @@ static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct prof
     arg->alloc_times_sum = 0;
     arg->free_times_sum = 0;
     arg->realloc_times_sum = 0;
+    arg->cpu_cost_sum_raw = 0;
+    arg->cpu_cost_sum_adj = 0;
+    arg->avg_profile_cost_per_call = 0.0;
 }
 
 struct sum_parent_stat_arg {
@@ -857,7 +863,49 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
 
+static uint64_t _safe_sub_u64(uint64_t a, uint64_t b) {
+    return (a >= b) ? (a - b) : 0;
+}
+
+static uint64_t _estimate_profile_cost_for_node(
+    struct icallpath_context* path,
+    struct callpath_node* node,
+    struct dump_call_path_arg* arg
+) {
+    if (!node || !arg) return 0;
+    if (path == arg->pcontext->callpath) {
+        return arg->pcontext->profile_extra_cpu_cost;
+    }
+    if (arg->avg_profile_cost_per_call <= 0.0) {
+        return 0;
+    }
+    return (uint64_t)(arg->avg_profile_cost_per_call * (double)node->call_count);
+}
+
+struct total_call_count_arg {
+    uint64_t count;
+};
+
+static void _sum_total_call_count_cb(uint64_t key, void* value, void* ud);
+
+static void _sum_total_call_count(struct icallpath_context* path, struct total_call_count_arg* arg) {
+    if (!path || !arg) return;
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    if (node) {
+        arg->count += node->call_count;
+    }
+    if (icallpath_children_size(path) > 0) {
+        icallpath_dump_children(path, _sum_total_call_count_cb, arg);
+    }
+}
+
+static void _sum_total_call_count_cb(uint64_t key, void* value, void* ud) {
+    (void)key;
+    _sum_total_call_count((struct icallpath_context*)value, (struct total_call_count_arg*)ud);
+}
+
 static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
+    (void)key;
     struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
     _dump_call_path((struct icallpath_context*)value, arg);
     lua_seti(arg->L, -2, ++arg->index);
@@ -888,6 +936,10 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     // 本节点的其他指标
     uint64_t cpu_cost = node->cpu_cost;
     uint64_t call_count = node->call_count;
+    uint64_t profile_cost_est = _estimate_profile_cost_for_node(path, node, arg);
+    uint64_t cpu_cost_adj = _safe_sub_u64(cpu_cost, profile_cost_est);
+    uint64_t cpu_self_cost = _safe_sub_u64(cpu_cost, child_arg.cpu_cost_sum_raw);
+    uint64_t cpu_self_cost_adj = _safe_sub_u64(cpu_cost_adj, child_arg.cpu_cost_sum_adj);
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
@@ -896,6 +948,8 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     arg->alloc_times_sum += alloc_times_incl;
     arg->free_times_sum += free_times_incl;
     arg->realloc_times_sum += realloc_times_incl;
+    arg->cpu_cost_sum_raw += cpu_cost;
+    arg->cpu_cost_sum_adj += cpu_cost_adj;
 
     // 导出本节点的聚合指标
     char name[512] = {0};
@@ -912,15 +966,41 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     lua_pushinteger(arg->L, cpu_cost);
     lua_setfield(arg->L, -2, "cpu_cost(ns)");
 
+    lua_pushinteger(arg->L, cpu_cost_adj);
+    lua_setfield(arg->L, -2, "cpu_cost_adj(ns)");
+
+    lua_pushinteger(arg->L, cpu_self_cost);
+    lua_setfield(arg->L, -2, "cpu_self_cost(ns)");
+
+    lua_pushinteger(arg->L, cpu_self_cost_adj);
+    lua_setfield(arg->L, -2, "cpu_self_cost_adj(ns)");
+
+    lua_pushinteger(arg->L, profile_cost_est);
+    lua_setfield(arg->L, -2, "profile_cost_est(ns)");
+
     uint64_t parent_cpu_cost = 0;
+    uint64_t parent_cpu_cost_adj = 0;
     if (node->parent) {
         parent_cpu_cost = node->parent->cpu_cost;
+        uint64_t parent_profile_cost_est = 0;
+        if (node->parent == (struct callpath_node*)icallpath_getvalue(arg->pcontext->callpath)) {
+            parent_profile_cost_est = arg->pcontext->profile_extra_cpu_cost;
+        } else if (arg->avg_profile_cost_per_call > 0.0) {
+            parent_profile_cost_est = (uint64_t)(arg->avg_profile_cost_per_call * (double)node->parent->call_count);
+        }
+        parent_cpu_cost_adj = _safe_sub_u64(parent_cpu_cost, parent_profile_cost_est);
     }
     double percent = parent_cpu_cost > 0 ? ((double)cpu_cost / parent_cpu_cost * 100.0) : 100;
     char percent_str[32] = {0};
     snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
     lua_pushstring(arg->L, percent_str);
     lua_setfield(arg->L, -2, "cpu_cost(%)");
+
+    double percent_adj = parent_cpu_cost_adj > 0 ? ((double)cpu_cost_adj / parent_cpu_cost_adj * 100.0) : 100;
+    char percent_adj_str[32] = {0};
+    snprintf(percent_adj_str, sizeof(percent_adj_str)-1, "%.2f", percent_adj);
+    lua_pushstring(arg->L, percent_adj_str);
+    lua_setfield(arg->L, -2, "cpu_cost_adj(%)");
 
     if (PROFILE_MODE_ON == arg->pcontext->mem_profile_mode) {
         lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
@@ -945,6 +1025,8 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     if (path == arg->pcontext->callpath) {
         lua_pushinteger(arg->L, arg->pcontext->profile_extra_cpu_cost);
         lua_setfield(arg->L, -2, "profile_extra_cpu_cost(ns)");
+        lua_pushnumber(arg->L, arg->avg_profile_cost_per_call);
+        lua_setfield(arg->L, -2, "profile_avg_cost_per_call(ns)");
     }
 }
 
@@ -972,6 +1054,15 @@ static void update_parent_stat(struct profile_context* pcontext, lua_State* L) {
 static void dump_call_path(struct profile_context* pcontext, lua_State* L) {
     struct dump_call_path_arg arg;
     _init_dump_call_path_arg(&arg, pcontext, L);
+    struct total_call_count_arg count_arg;
+    count_arg.count = 0;
+    if (pcontext->callpath && icallpath_children_size(pcontext->callpath) > 0) {
+        icallpath_dump_children(pcontext->callpath, _sum_total_call_count_cb, &count_arg);
+    }
+    if (count_arg.count > 0) {
+        arg.avg_profile_cost_per_call =
+            (double)pcontext->profile_extra_cpu_cost / (double)count_arg.count;
+    }
     _dump_call_path(pcontext->callpath, &arg);
 }
 
