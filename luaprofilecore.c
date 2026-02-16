@@ -341,7 +341,6 @@ struct profile_context {
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
     int         mem_profile_mode;       // MODE_*
-    uint64_t    profile_extra_cpu_cost;  // profiling logic cost (in nanoseconds)
 };
 
 struct callpath_node {
@@ -489,7 +488,6 @@ profile_create() {
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     context->mem_profile_mode = PROFILE_MODE_OFF;
-    context->profile_extra_cpu_cost = 0;
     return context;
 }
 
@@ -827,7 +825,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
         uint64_t now_time = get_mono_ns();
         frame->call_time = now_time;
-        context->profile_extra_cpu_cost += (now_time - begin_time);
 
     } else if (event == LUA_HOOKRET) {
         if (cs->top <= 0) {
@@ -848,8 +845,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
             tail_call = pre_frame ? cur_frame->tail : false;
         } while(tail_call);
 
-        uint64_t now_time = get_mono_ns();
-        context->profile_extra_cpu_cost += (now_time - begin_time);
     }
 
     context->running_in_hook = false;
@@ -942,10 +937,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
         lua_setfield(arg->L, -2, "inuse_bytes");
     }
 
-    if (path == arg->pcontext->callpath) {
-        lua_pushinteger(arg->L, arg->pcontext->profile_extra_cpu_cost);
-        lua_setfield(arg->L, -2, "profile_extra_cpu_cost(ns)");
-    }
 }
 
 static void _sum_parent_stat(uint64_t key, void* value, void* ud) {
