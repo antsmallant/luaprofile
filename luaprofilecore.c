@@ -282,6 +282,11 @@ get_mono_ns() {
     return sec * (uint64_t)NANOSEC + nsec;
 }
 
+static inline uint64_t safe_u64_minus(uint64_t big, uint64_t small) {
+    if (big <= small) return 0;
+    return big-small;
+}
+
 #ifdef GET_REALTIME
 // 获取绝对时间戳（纳秒），会受 NTP 调整。
 // 可以用于获取当前的年月日。
@@ -351,7 +356,8 @@ struct callpath_node {
     int     depth;
     uint64_t last_ret_time;
     uint64_t call_count;
-    uint64_t cpu_cost;
+    uint64_t raw_cpu_cost;
+    uint64_t profiler_cpu_cost;
     uint64_t alloc_bytes;
     uint64_t free_bytes;
     uint64_t alloc_times;
@@ -380,7 +386,8 @@ callpath_node_create() {
     node->depth = 0;
     node->last_ret_time = 0;
     node->call_count = 0;
-    node->cpu_cost = 0;
+    node->raw_cpu_cost = 0;
+    node->profiler_cpu_cost = 0;
     node->alloc_bytes = 0;
     node->free_bytes = 0;
     node->alloc_times = 0;
@@ -417,14 +424,6 @@ static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct prof
     arg->alloc_times_sum = 0;
     arg->free_times_sum = 0;
     arg->realloc_times_sum = 0;
-}
-
-struct sum_parent_stat_arg {
-    uint64_t cpu_cost_sum;
-};
-
-static void _init_sum_parent_stat_arg(struct sum_parent_stat_arg* arg) {
-    arg->cpu_cost_sum = 0;
 }
 
 static inline char*
@@ -603,7 +602,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         node->parent = path_parent;
         node->depth = path_parent->depth + 1;
         node->last_ret_time = 0;
-        node->cpu_cost = 0;
+        node->raw_cpu_cost = 0;
         node->call_count = 0;
         cur_path = icallpath_add_child(pre_path, k, node);
     }
@@ -815,6 +814,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
             pre_callpath = pre_frame->path;
         }
         struct call_frame* frame = push_callframe(cs);
+        frame->call_time = begin_time;
         frame->tail = (event == LUA_HOOKTAILCALL);
         frame->co_cost = 0;
         frame->prototype = _get_prototype(L, far);    
@@ -822,9 +822,8 @@ _hook_call(lua_State* L, lua_Debug* far) {
         if (frame->path) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
             ++node->call_count;
+            node->profiler_cpu_cost += safe_u64_minus(get_mono_ns(), begin_time);
         }
-        uint64_t now_time = get_mono_ns();
-        frame->call_time = now_time;
 
     } else if (event == LUA_HOOKRET) {
         if (cs->top <= 0) {
@@ -835,11 +834,11 @@ _hook_call(lua_State* L, lua_Debug* far) {
         do {
             struct call_frame* cur_frame = pop_callframe(cs);
             struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
-            uint64_t total_cpu_cost = begin_time - cur_frame->call_time;
-            uint64_t actual_cpu_cost = total_cpu_cost - cur_frame->co_cost;
-            assert(begin_time >= cur_frame->call_time && total_cpu_cost >= cur_frame->co_cost);
+            uint64_t total_cpu_cost = safe_u64_minus(begin_time, cur_frame->call_time);
+            uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, cur_frame->co_cost);
             cur_path->last_ret_time = begin_time;
-            cur_path->cpu_cost += actual_cpu_cost;
+            cur_path->raw_cpu_cost += actual_cpu_cost;
+            cur_path->profiler_cpu_cost += safe_u64_minus(get_mono_ns(), begin_time);
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
@@ -881,7 +880,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
 
     // 本节点的其他指标
-    uint64_t cpu_cost = node->cpu_cost;
+    uint64_t cpu_cost = node->raw_cpu_cost;
     uint64_t call_count = node->call_count;
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
@@ -909,7 +908,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
 
     uint64_t parent_cpu_cost = 0;
     if (node->parent) {
-        parent_cpu_cost = node->parent->cpu_cost;
+        parent_cpu_cost = node->parent->raw_cpu_cost;
     }
     double percent = parent_cpu_cost > 0 ? ((double)cpu_cost / parent_cpu_cost * 100.0) : 100;
     char percent_str[32] = {0};
@@ -937,27 +936,6 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
         lua_setfield(arg->L, -2, "inuse_bytes");
     }
 
-}
-
-static void _sum_parent_stat(uint64_t key, void* value, void* ud) {
-    struct sum_parent_stat_arg* arg = (struct sum_parent_stat_arg*)ud;
-    struct icallpath_context* path = (struct icallpath_context*)value;
-    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
-    arg->cpu_cost_sum += node->cpu_cost;
-}
-
-static void update_parent_stat(struct profile_context* pcontext, lua_State* L) {
-    struct icallpath_context* path = pcontext->callpath;
-    if (!path) return;
-    struct callpath_node* parent = (struct callpath_node*)icallpath_getvalue(path);
-    if (!parent) return;
-
-    if (icallpath_children_size(path) > 0) {
-        struct sum_parent_stat_arg arg;
-        _init_sum_parent_stat_arg(&arg);
-        icallpath_dump_children(path, _sum_parent_stat, &arg);
-        parent->cpu_cost = arg.cpu_cost_sum;
-    }
 }
 
 static void dump_call_path(struct profile_context* pcontext, lua_State* L) {
@@ -1129,6 +1107,12 @@ static int
 ldump(lua_State* L) {
     struct profile_context* context = get_profile_context(L);
     if (context) {
+        // update root cpu cost
+        if (context->callpath) {
+            struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
+            root->raw_cpu_cost = get_mono_ns() - context->start_time;
+        }
+
         // full gc to free objects, make mem profile more accurate
         if (PROFILE_MODE_ON ==context->mem_profile_mode) {
             lua_gc(L, LUA_GCCOLLECT, 0);
@@ -1144,7 +1128,6 @@ ldump(lua_State* L) {
 
         // tracing dump
         if (context->callpath) {
-            update_parent_stat(context, L);
             dump_call_path(context, L);
         } else {
             lua_newtable(L);
