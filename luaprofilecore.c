@@ -1126,7 +1126,7 @@ ldump(lua_State* L) {
         double profile_duration = (cur_time - context->start_time)*1.0/NANOSEC;
         lua_pushnumber(L, profile_duration);
 
-        // tracing dump
+        // dump
         if (context->callpath) {
             dump_call_path(context, L);
         } else {
