@@ -430,6 +430,10 @@ static uint64_t compute_call_count_incl(struct icallpath_context* path) {
     return node->call_count_incl;
 }
 
+static inline bool is_root_path(struct profile_context* pcontext, struct icallpath_context* path) {
+    return path == pcontext->callpath;
+}
+
 static struct alloc_node*
 alloc_node_create() {
     struct alloc_node* node = (struct alloc_node*)pmalloc(sizeof(*node));
@@ -922,14 +926,9 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     // 本节点的其他指标
     uint64_t cpu_cost_raw = node->cpu_cost_raw;
     uint64_t call_count = node->call_count;
-    bool is_root = (path == arg->pcontext->callpath);
-    uint64_t call_count_for_profile = is_root ? arg->pcontext->cpu_call_count_total : node->call_count_incl;
-    uint64_t cpu_cost_real = 0;
-    if (is_root) {
-        cpu_cost_real = safe_u64_minus(cpu_cost_raw, arg->pcontext->profiler_cpu_cost_total);
-    } else {
-        cpu_cost_real = calc_cpu_cost_real(cpu_cost_raw, call_count_for_profile, arg->avg_profiler_cost_per_call);
-    }
+    bool is_root = is_root_path(arg->pcontext, path);
+    uint64_t call_count_for_profile = node->call_count_incl;
+    uint64_t cpu_cost_real = calc_cpu_cost_real(cpu_cost_raw, call_count_for_profile, arg->avg_profiler_cost_per_call);
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
@@ -962,11 +961,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t parent_cpu_cost_real = 0;
     if (node->parent) {
         parent_cpu_cost_raw = node->parent->cpu_cost_raw;
-        if (node->parent == (struct callpath_node*)icallpath_getvalue(arg->pcontext->callpath)) {
-            parent_cpu_cost_real = safe_u64_minus(parent_cpu_cost_raw, arg->pcontext->profiler_cpu_cost_total);
-        } else {
-            parent_cpu_cost_real = calc_cpu_cost_real(parent_cpu_cost_raw, node->parent->call_count_incl, arg->avg_profiler_cost_per_call);
-        }
+        parent_cpu_cost_real = calc_cpu_cost_real(node->parent->cpu_cost_raw, node->parent->call_count_incl, arg->avg_profiler_cost_per_call);
     }
 
     double percent_raw = parent_cpu_cost_raw > 0 ? ((double)cpu_cost_raw / parent_cpu_cost_raw * 100.0) : 100;
@@ -1015,6 +1010,10 @@ static void dump_call_path(struct profile_context* pcontext, lua_State* L) {
     _init_dump_call_path_arg(&arg, pcontext, L);
     if (pcontext->callpath) {
         compute_call_count_incl(pcontext->callpath);
+        struct callpath_node* root_node = (struct callpath_node*)icallpath_getvalue(pcontext->callpath);
+        if (root_node) {
+            root_node->call_count_incl = pcontext->cpu_call_count_total;
+        }
     }
     if (pcontext->cpu_call_count_total > 0) {
         arg.avg_profiler_cost_per_call =
