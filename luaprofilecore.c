@@ -44,6 +44,7 @@ static char profile_context_key = 'x';
 struct icallpath_context {
     uint64_t key;
     void* value;
+    struct icallpath_context* parent;
     struct imap_context* children;
 };
 
@@ -228,6 +229,7 @@ static struct icallpath_context* icallpath_create(uint64_t key, void* value) {
     struct icallpath_context* icallpath = (struct icallpath_context*)pmalloc(sizeof(*icallpath));
     icallpath->key = key;
     icallpath->value = value;
+    icallpath->parent = NULL;
     icallpath->children = imap_create();
 
     return icallpath;
@@ -254,6 +256,7 @@ static struct icallpath_context* icallpath_get_child(struct icallpath_context* i
 
 static struct icallpath_context* icallpath_add_child(struct icallpath_context* icallpath, uint64_t key, void* value) {
     struct icallpath_context* child_path = icallpath_create(key, value);
+    child_path->parent = icallpath;
     imap_set(icallpath->children, key, child_path);
     return child_path;
 }
@@ -850,17 +853,44 @@ _hook_call(lua_State* L, lua_Debug* far) {
     assert(cs->co == L);
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
+        struct call_frame* frame = NULL;
         struct icallpath_context* pre_callpath = NULL;
-        struct call_frame* pre_frame = cur_callframe(cs);
-        if (pre_frame) {
-            pre_callpath = pre_frame->path;
+
+        if (event == LUA_HOOKTAILCALL && cs->top > 0) {
+            // 尾调用语义：当前栈帧被新函数替换（同一层级），先结算旧栈帧，再原地覆盖为新栈帧
+            struct call_frame* old_frame = cur_callframe(cs);
+            const void* new_proto = _get_prototype(L, far);
+            struct callpath_node* old_path = (struct callpath_node*)icallpath_getvalue(old_frame->path);
+            uint64_t total_cpu_cost = safe_u64_minus(begin_time, old_frame->call_time);
+            uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, old_frame->co_cost);
+            if (old_path) {
+                old_path->last_ret_time = begin_time;
+                old_path->cpu_cost_raw += actual_cpu_cost;
+            }
+
+            if (new_proto == old_frame->prototype) {
+                // 自尾递归：挂回父层，复用同 key 子节点，避免递归深链
+                pre_callpath = old_frame->path ? old_frame->path->parent : NULL;
+                if (!pre_callpath) pre_callpath = context->callpath;
+            } else {
+                // 非自尾递归：保持调用关系，仍挂在当前 frame 下
+                pre_callpath = old_frame->path;
+            }
+            frame = old_frame;
+            frame->prototype = new_proto;
+        } else {
+            struct call_frame* pre_frame = cur_callframe(cs);
+            if (pre_frame) {
+                pre_callpath = pre_frame->path;
+            }
+            frame = push_callframe(cs);
+            frame->prototype = _get_prototype(L, far);
         }
-        struct call_frame* frame = push_callframe(cs);
+
         frame->call_time = begin_time;
-        frame->tail = (event == LUA_HOOKTAILCALL);
+        frame->tail = false;
         frame->co_cost = 0;
         context->cpu_call_count_total++;
-        frame->prototype = _get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
         if (frame->path) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);

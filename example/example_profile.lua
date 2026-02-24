@@ -97,7 +97,27 @@ local function scenario_tailcall()
     return tail_worker(1200, 0)
 end
 
--- 场景6：内存分配/释放
+-- 场景6：f -> g -> h 尾调用链，验证不会误合并
+local function scenario_tailcall_fgh()
+    local function h(n)
+        if n <= 0 then
+            return 0
+        end
+        return h(n - 1)
+    end
+
+    local function g(n)
+        return h(n)
+    end
+
+    local function f(n)
+        return g(n)
+    end
+
+    return f(800)
+end
+
+-- 场景7：内存分配/释放
 local g_storage = {}
 local function scenario_memory_activity()
     for i = 1, 200 do
@@ -116,6 +136,7 @@ local function run_scenarios()
     scenario_builtin_c_functions()
     scenario_coroutine_switch()
     scenario_tailcall()
+    scenario_tailcall_fgh()
     scenario_memory_activity()
 end
 
