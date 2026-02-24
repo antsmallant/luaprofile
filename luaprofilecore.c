@@ -287,6 +287,14 @@ static inline uint64_t safe_u64_minus(uint64_t big, uint64_t small) {
     return big-small;
 }
 
+static inline uint64_t calc_cpu_cost_real(uint64_t cpu_cost_raw, uint64_t call_count, double avg_profiler_cost_per_call) {
+    if (avg_profiler_cost_per_call <= 0.0 || call_count == 0) {
+        return cpu_cost_raw;
+    }
+    uint64_t avg_cost = (uint64_t)(avg_profiler_cost_per_call * (double)call_count);
+    return safe_u64_minus(cpu_cost_raw, avg_cost);
+}
+
 #ifdef GET_REALTIME
 // 获取绝对时间戳（纳秒），会受 NTP 调整。
 // 可以用于获取当前的年月日。
@@ -346,6 +354,8 @@ struct profile_context {
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
     int         mem_profile_mode; // define in PROFILE_MODE enum
+    uint64_t    profiler_cpu_cost_total;
+    uint64_t    cpu_call_count_total;
 };
 
 struct callpath_node {
@@ -356,8 +366,8 @@ struct callpath_node {
     int     depth;
     uint64_t last_ret_time;
     uint64_t call_count;
-    uint64_t raw_cpu_cost;
-    uint64_t profiler_cpu_cost;
+    uint64_t call_count_incl;
+    uint64_t cpu_cost_raw;
     uint64_t alloc_bytes;
     uint64_t free_bytes;
     uint64_t alloc_times;
@@ -386,14 +396,38 @@ callpath_node_create() {
     node->depth = 0;
     node->last_ret_time = 0;
     node->call_count = 0;
-    node->raw_cpu_cost = 0;
-    node->profiler_cpu_cost = 0;
+    node->call_count_incl = 0;
+    node->cpu_cost_raw = 0;
     node->alloc_bytes = 0;
     node->free_bytes = 0;
     node->alloc_times = 0;
     node->free_times = 0;
     node->realloc_times = 0;
     return node;
+}
+
+struct sum_call_count_arg {
+    uint64_t sum;
+};
+
+static uint64_t compute_call_count_incl(struct icallpath_context* path);
+
+static void _sum_call_count_incl_child(uint64_t key, void* value, void* ud) {
+    (void)key;
+    struct sum_call_count_arg* arg = (struct sum_call_count_arg*)ud;
+    arg->sum += compute_call_count_incl((struct icallpath_context*)value);
+}
+
+static uint64_t compute_call_count_incl(struct icallpath_context* path) {
+    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(path);
+    if (!node) return 0;
+
+    struct sum_call_count_arg arg = {0};
+    if (icallpath_children_size(path) > 0) {
+        icallpath_dump_children(path, _sum_call_count_incl_child, &arg);
+    }
+    node->call_count_incl = node->call_count + arg.sum;
+    return node->call_count_incl;
 }
 
 static struct alloc_node*
@@ -413,6 +447,7 @@ struct dump_call_path_arg {
     uint64_t alloc_times_sum;
     uint64_t free_times_sum;
     uint64_t realloc_times_sum;
+    double avg_profiler_cost_per_call;
 };
 
 static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct profile_context* pcontext, lua_State* L) {
@@ -424,6 +459,7 @@ static void _init_dump_call_path_arg(struct dump_call_path_arg* arg, struct prof
     arg->alloc_times_sum = 0;
     arg->free_times_sum = 0;
     arg->realloc_times_sum = 0;
+    arg->avg_profiler_cost_per_call = 0;
 }
 
 static inline char*
@@ -487,6 +523,8 @@ profile_create() {
     context->last_alloc_f = NULL;
     context->last_alloc_ud = NULL;
     context->mem_profile_mode = PROFILE_MODE_OFF;
+    context->profiler_cpu_cost_total = 0;
+    context->cpu_call_count_total = 0;
     return context;
 }
 
@@ -602,7 +640,7 @@ get_frame_path(struct profile_context* context, lua_State* co, lua_Debug* far, s
         node->parent = path_parent;
         node->depth = path_parent->depth + 1;
         node->last_ret_time = 0;
-        node->raw_cpu_cost = 0;
+        node->cpu_cost_raw = 0;
         node->call_count = 0;
         cur_path = icallpath_add_child(pre_path, k, node);
     }
@@ -817,16 +855,17 @@ _hook_call(lua_State* L, lua_Debug* far) {
         frame->call_time = begin_time;
         frame->tail = (event == LUA_HOOKTAILCALL);
         frame->co_cost = 0;
+        context->cpu_call_count_total++;
         frame->prototype = _get_prototype(L, far);    
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
         if (frame->path) {
             struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(frame->path);
             ++node->call_count;
-            node->profiler_cpu_cost += safe_u64_minus(get_mono_ns(), begin_time);
         }
 
     } else if (event == LUA_HOOKRET) {
         if (cs->top <= 0) {
+            context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
             context->running_in_hook = false;
             return;
         }
@@ -837,8 +876,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
             uint64_t total_cpu_cost = safe_u64_minus(begin_time, cur_frame->call_time);
             uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, cur_frame->co_cost);
             cur_path->last_ret_time = begin_time;
-            cur_path->raw_cpu_cost += actual_cpu_cost;
-            cur_path->profiler_cpu_cost += safe_u64_minus(get_mono_ns(), begin_time);
+            cur_path->cpu_cost_raw += actual_cpu_cost;
 
             struct call_frame* pre_frame = cur_callframe(cs);
             tail_call = pre_frame ? cur_frame->tail : false;
@@ -846,6 +884,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
 
     }
 
+    context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
     context->running_in_hook = false;
 }
 
@@ -864,6 +903,7 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     // 递归获取所有子节点的指标和
     struct dump_call_path_arg child_arg;
     _init_dump_call_path_arg(&child_arg, arg->pcontext, arg->L);
+    child_arg.avg_profiler_cost_per_call = arg->avg_profiler_cost_per_call;
     if (icallpath_children_size(path) > 0) {
         lua_newtable(arg->L);
         icallpath_dump_children(path, _dump_call_path_child, &child_arg);
@@ -880,8 +920,16 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     uint64_t realloc_times_incl = node->realloc_times + child_arg.realloc_times_sum;
 
     // 本节点的其他指标
-    uint64_t cpu_cost = node->raw_cpu_cost;
+    uint64_t cpu_cost_raw = node->cpu_cost_raw;
     uint64_t call_count = node->call_count;
+    bool is_root = (path == arg->pcontext->callpath);
+    uint64_t call_count_for_profile = is_root ? arg->pcontext->cpu_call_count_total : node->call_count_incl;
+    uint64_t cpu_cost_real = 0;
+    if (is_root) {
+        cpu_cost_real = safe_u64_minus(cpu_cost_raw, arg->pcontext->profiler_cpu_cost_total);
+    } else {
+        cpu_cost_real = calc_cpu_cost_real(cpu_cost_raw, call_count_for_profile, arg->avg_profiler_cost_per_call);
+    }
     uint64_t inuse_bytes = (alloc_bytes_incl >= free_bytes_incl ? alloc_bytes_incl - free_bytes_incl : 9999999999);
 
     // 累加到父节点
@@ -902,19 +950,36 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
     
     lua_pushinteger(arg->L, call_count);
     lua_setfield(arg->L, -2, "call_count");
+    lua_pushinteger(arg->L, call_count_for_profile);
+    lua_setfield(arg->L, -2, "call_count_incl");
 
-    lua_pushinteger(arg->L, cpu_cost);
-    lua_setfield(arg->L, -2, "cpu_cost(ns)");
+    lua_pushinteger(arg->L, cpu_cost_raw);
+    lua_setfield(arg->L, -2, "cpu_cost_raw(ns)");
+    lua_pushinteger(arg->L, cpu_cost_real);
+    lua_setfield(arg->L, -2, "cpu_cost_real(ns)");
 
-    uint64_t parent_cpu_cost = 0;
+    uint64_t parent_cpu_cost_raw = 0;
+    uint64_t parent_cpu_cost_real = 0;
     if (node->parent) {
-        parent_cpu_cost = node->parent->raw_cpu_cost;
+        parent_cpu_cost_raw = node->parent->cpu_cost_raw;
+        if (node->parent == (struct callpath_node*)icallpath_getvalue(arg->pcontext->callpath)) {
+            parent_cpu_cost_real = safe_u64_minus(parent_cpu_cost_raw, arg->pcontext->profiler_cpu_cost_total);
+        } else {
+            parent_cpu_cost_real = calc_cpu_cost_real(parent_cpu_cost_raw, node->parent->call_count_incl, arg->avg_profiler_cost_per_call);
+        }
     }
-    double percent = parent_cpu_cost > 0 ? ((double)cpu_cost / parent_cpu_cost * 100.0) : 100;
-    char percent_str[32] = {0};
-    snprintf(percent_str, sizeof(percent_str)-1, "%.2f", percent);
-    lua_pushstring(arg->L, percent_str);
-    lua_setfield(arg->L, -2, "cpu_cost(%)");
+
+    double percent_raw = parent_cpu_cost_raw > 0 ? ((double)cpu_cost_raw / parent_cpu_cost_raw * 100.0) : 100;
+    char percent_raw_str[32] = {0};
+    snprintf(percent_raw_str, sizeof(percent_raw_str)-1, "%.2f", percent_raw);
+    lua_pushstring(arg->L, percent_raw_str);
+    lua_setfield(arg->L, -2, "cpu_cost_raw(%)");
+
+    double percent_real = parent_cpu_cost_real > 0 ? ((double)cpu_cost_real / parent_cpu_cost_real * 100.0) : 100;
+    char percent_real_str[32] = {0};
+    snprintf(percent_real_str, sizeof(percent_real_str)-1, "%.2f", percent_real);
+    lua_pushstring(arg->L, percent_real_str);
+    lua_setfield(arg->L, -2, "cpu_cost_real(%)");
 
     if (PROFILE_MODE_ON == arg->pcontext->mem_profile_mode) {
         lua_pushinteger(arg->L, (lua_Integer)alloc_bytes_incl);
@@ -935,12 +1000,26 @@ static void _dump_call_path(struct icallpath_context* path, struct dump_call_pat
         lua_pushinteger(arg->L, (lua_Integer)inuse_bytes);
         lua_setfield(arg->L, -2, "inuse_bytes");
     }
-
+    if (is_root) {
+        lua_pushinteger(arg->L, arg->pcontext->profiler_cpu_cost_total);
+        lua_setfield(arg->L, -2, "profiler_cpu_cost_total(ns)");
+        lua_pushinteger(arg->L, arg->pcontext->cpu_call_count_total);
+        lua_setfield(arg->L, -2, "cpu_call_count_total");
+        lua_pushnumber(arg->L, arg->avg_profiler_cost_per_call);
+        lua_setfield(arg->L, -2, "avg_profiler_cost_per_call(ns)");
+    }
 }
 
 static void dump_call_path(struct profile_context* pcontext, lua_State* L) {
     struct dump_call_path_arg arg;
     _init_dump_call_path_arg(&arg, pcontext, L);
+    if (pcontext->callpath) {
+        compute_call_count_incl(pcontext->callpath);
+    }
+    if (pcontext->cpu_call_count_total > 0) {
+        arg.avg_profiler_cost_per_call =
+            (double)pcontext->profiler_cpu_cost_total / (double)pcontext->cpu_call_count_total;
+    }
     _dump_call_path(pcontext->callpath, &arg);
 }
 
@@ -1107,7 +1186,7 @@ ldump(lua_State* L) {
         // update root cpu cost
         if (context->callpath) {
             struct callpath_node* root = (struct callpath_node*)icallpath_getvalue(context->callpath);
-            root->raw_cpu_cost = get_mono_ns() - context->start_time;
+            root->cpu_cost_raw = get_mono_ns() - context->start_time;
         }
 
         // full gc to free objects, make mem profile more accurate
