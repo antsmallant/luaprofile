@@ -979,7 +979,8 @@ lstart(lua_State* L) {
         return 0;
     }
 
-    // parse options: start([opts]), opts is a table
+    // parse options: start([opts]), opts is a table like: { mem_profile = "off|on" }
+    // mem_profile 为 off 表示不需要内存 profile，为 on 表示需要内存 profile
     int mem_profile_mode = PROFILE_MODE_OFF;
     bool read_ok = read_arg(L, &mem_profile_mode);
     if (!read_ok) {

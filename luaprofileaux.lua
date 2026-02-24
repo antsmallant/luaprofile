@@ -22,7 +22,8 @@ local function my_coroutine_wrap(f)
         end)
 end
 
--- opts = { mem_profile = "off|on" }
+---启动 profile
+---@param opts table 启动参数，格式为 { mem_profile = "off|on" }，mem_profile 为 on 表示需要内存 profile， off 反之。
 function M.start(opts)
     if M._is_profile_started then
         print("profile start fail, already started")
@@ -36,6 +37,8 @@ function M.start(opts)
     coroutine.wrap = my_coroutine_wrap
 end
 
+---停止 profile
+---@return table 返回 profile 结果，格式为 { start_time = "YYYY-MM-DD HH:MM:SS", duration_seconds = 100, nodes = table }
 function M.stop()
     if not M._is_profile_started then
         print("profile stop fail, not started")
