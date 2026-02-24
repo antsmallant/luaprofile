@@ -27,7 +27,7 @@ Check https://github.com/antsmallant/luaprofile for more.
 #define pfree     free
 #define pcalloc   calloc
 
-#define MAX_CALL_SIZE               1024
+#define MAX_CALL_SIZE               2048
 #define MAX_CO_SIZE                 10240
 #define NANOSEC                     1000000000
 #define MICROSEC                    1000000
