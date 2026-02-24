@@ -306,13 +306,13 @@ read_arg(lua_State* L, int* out_mem_profile) {
     if (!out_mem_profile) return false;
     if (lua_gettop(L) < 1 || !lua_istable(L, 1)) return true;
 
-    // 是否启用 内存 profile
+    // 是否启用内存 profile
     lua_getfield(L, 1, "mem_profile");
     if (lua_isstring(L, -1)) {
         const char* s = lua_tostring(L, -1);
         if (strcmp(s, "off") == 0) *out_mem_profile = PROFILE_MODE_OFF;
         else if (strcmp(s, "on") == 0) *out_mem_profile = PROFILE_MODE_ON;
-        else {printf("invalid mem_profile mode: %s\n", s); return false;}
+        else {printf("ERROR: invalid mem_profile mode: %s\n", s); return false;}
     }
     lua_pop(L, 1);
 
@@ -345,7 +345,7 @@ struct profile_context {
     struct imap_context*        symbol_map;
     struct icallpath_context*   callpath;
     struct call_state*          cur_cs;
-    int         mem_profile_mode;       // MODE_*
+    int         mem_profile_mode; // define in PROFILE_MODE enum
 };
 
 struct callpath_node {
