@@ -333,7 +333,6 @@ read_arg(lua_State* L, int* out_mem_profile) {
 struct call_frame {
     const void* prototype;
     struct icallpath_context*   path;
-    bool  tail;
     uint64_t call_time;
     uint64_t co_cost;     // co yield cost 
 };
@@ -888,7 +887,6 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
 
         frame->call_time = begin_time;
-        frame->tail = false;
         frame->co_cost = 0;
         context->cpu_call_count_total++;
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
@@ -903,18 +901,12 @@ _hook_call(lua_State* L, lua_Debug* far) {
             context->running_in_hook = false;
             return;
         }
-        bool tail_call = false;
-        do {
-            struct call_frame* cur_frame = pop_callframe(cs);
-            struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
-            uint64_t total_cpu_cost = safe_u64_minus(begin_time, cur_frame->call_time);
-            uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, cur_frame->co_cost);
-            cur_path->last_ret_time = begin_time;
-            cur_path->cpu_cost_raw += actual_cpu_cost;
-
-            struct call_frame* pre_frame = cur_callframe(cs);
-            tail_call = pre_frame ? cur_frame->tail : false;
-        } while(tail_call);
+        struct call_frame* cur_frame = pop_callframe(cs);
+        struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
+        uint64_t total_cpu_cost = safe_u64_minus(begin_time, cur_frame->call_time);
+        uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, cur_frame->co_cost);
+        cur_path->last_ret_time = begin_time;
+        cur_path->cpu_cost_raw += actual_cpu_cost;
 
     }
 
