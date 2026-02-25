@@ -333,6 +333,7 @@ read_arg(lua_State* L, int* out_mem_profile) {
 struct call_frame {
     const void* prototype;
     struct icallpath_context*   path;
+    bool    tail_pending;  // true: 该帧已发起 tailcall，等待子调用返回后再隐式结算
     uint64_t call_time;
     uint64_t co_cost;     // co yield cost 
 };
@@ -601,6 +602,17 @@ cur_callframe(struct call_state* cs) {
     return &cs->call_list[idx];
 }
 
+static inline void
+settle_frame_on_return(struct call_frame* frame, uint64_t ret_time) {
+    if (!frame || !frame->path) return;
+    struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(frame->path);
+    if (!cur_path) return;
+    uint64_t total_cpu_cost = safe_u64_minus(ret_time, frame->call_time);
+    uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, frame->co_cost);
+    cur_path->last_ret_time = ret_time;
+    cur_path->cpu_cost_raw += actual_cpu_cost;
+}
+
 static inline struct profile_context *
 get_profile_context(lua_State* L) {
     struct profile_context* ctx = NULL;
@@ -856,26 +868,26 @@ _hook_call(lua_State* L, lua_Debug* far) {
         struct icallpath_context* pre_callpath = NULL;
 
         if (event == LUA_HOOKTAILCALL && cs->top > 0) {
-            // 尾调用语义：当前栈帧被新函数替换（同一层级），先结算旧栈帧，再原地覆盖为新栈帧
+            // 尾调用语义：当前帧不会收到独立 RET。
+            // 非自尾递归：把当前帧标记为 pending，压入子调用帧；最终 RET 时级联结算。
+            // 自尾递归：仅增加调用次数，不新增帧，避免深递归撑爆 call_frame 栈。
             struct call_frame* old_frame = cur_callframe(cs);
             const void* new_proto = _get_prototype(L, far);
-            struct callpath_node* old_path = (struct callpath_node*)icallpath_getvalue(old_frame->path);
-            uint64_t total_cpu_cost = safe_u64_minus(begin_time, old_frame->call_time);
-            uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, old_frame->co_cost);
-            if (old_path) {
-                old_path->last_ret_time = begin_time;
-                old_path->cpu_cost_raw += actual_cpu_cost;
+            if (new_proto == old_frame->prototype) {
+                // 自尾递归聚合到同一节点：不改 frame 的 call_time/path，仅增加 call_count
+                context->cpu_call_count_total++;
+                if (old_frame->path) {
+                    struct callpath_node* node = (struct callpath_node*)icallpath_getvalue(old_frame->path);
+                    if (node) ++node->call_count;
+                }
+                context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
+                context->running_in_hook = false;
+                return;
             }
 
-            if (new_proto == old_frame->prototype) {
-                // 自尾递归：挂回父层，复用同 key 子节点，避免递归深链
-                pre_callpath = old_frame->path ? old_frame->path->parent : NULL;
-                if (!pre_callpath) pre_callpath = context->callpath;
-            } else {
-                // 非自尾递归：保持调用关系，仍挂在当前 frame 下
-                pre_callpath = old_frame->path;
-            }
-            frame = old_frame;
+            old_frame->tail_pending = true;
+            pre_callpath = old_frame->path;
+            frame = push_callframe(cs);
             frame->prototype = new_proto;
         } else {
             struct call_frame* pre_frame = cur_callframe(cs);
@@ -887,6 +899,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
 
         frame->call_time = begin_time;
+        frame->tail_pending = false;
         frame->co_cost = 0;
         context->cpu_call_count_total++;
         frame->path = get_frame_path(context, L, far, pre_callpath, frame);
@@ -902,11 +915,13 @@ _hook_call(lua_State* L, lua_Debug* far) {
             return;
         }
         struct call_frame* cur_frame = pop_callframe(cs);
-        struct callpath_node* cur_path = (struct callpath_node*)icallpath_getvalue(cur_frame->path);
-        uint64_t total_cpu_cost = safe_u64_minus(begin_time, cur_frame->call_time);
-        uint64_t actual_cpu_cost = safe_u64_minus(total_cpu_cost, cur_frame->co_cost);
-        cur_path->last_ret_time = begin_time;
-        cur_path->cpu_cost_raw += actual_cpu_cost;
+        settle_frame_on_return(cur_frame, begin_time);
+        while (cs->top > 0) {
+            struct call_frame* pre_frame = cur_callframe(cs);
+            if (!pre_frame->tail_pending) break;
+            cur_frame = pop_callframe(cs);
+            settle_frame_on_return(cur_frame, begin_time);
+        }
 
     }
 
