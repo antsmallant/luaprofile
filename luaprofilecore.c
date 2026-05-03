@@ -119,6 +119,7 @@ _imap_rehash(struct imap_context* imap) {
         }
     }
 
+    (void)old_count;
     assert(old_count == imap->count);
     pfree(old_slots);
 }
@@ -236,6 +237,8 @@ static struct icallpath_context* icallpath_create(uint64_t key, void* value) {
 }
 
 static void icallpath_free_child(uint64_t key, void* value, void* ud) {
+    (void)key;
+    (void)ud;
     icallpath_free((struct icallpath_context*)value);
 }
 
@@ -538,6 +541,8 @@ profile_create() {
 
 static void
 _ob_free_call_state(uint64_t key, void* value, void* ud) {
+    (void)key;
+    (void)ud;
     pfree(value);
 }
 
@@ -709,6 +714,7 @@ local function test1()
 end
 */
 static const void* _get_prototype(lua_State* L, lua_Debug* ar) {
+    (void)L;
     const void* proto = NULL;
 
     if (ar->i_ci && ar->i_ci->func.p) {
@@ -974,6 +980,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
 static void _dump_call_path(struct icallpath_context* path, struct dump_call_path_arg* arg);
 
 static void _dump_call_path_child(uint64_t key, void* value, void* ud) {
+    (void)key;
     struct dump_call_path_arg* arg = (struct dump_call_path_arg*)ud;
     _dump_call_path((struct icallpath_context*)value, arg);
     lua_seti(arg->L, -2, ++arg->index);
