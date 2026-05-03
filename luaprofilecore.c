@@ -342,6 +342,7 @@ struct call_state {
     lua_State*  co;
     uint64_t    leave_time; // co yield begin time
     int         top;
+    int         skipped_call_depth;
     struct call_frame call_list[0];
 };
 
@@ -579,7 +580,8 @@ profile_free(struct profile_context* context) {
 static inline struct call_frame *
 push_callframe(struct call_state* cs) {
     if(cs->top >= MAX_CALL_SIZE) {
-        assert(false);
+        printf("ERROR: luaprofile call stack overflow, skip deeper calls\n");
+        return NULL;
     }
     return &cs->call_list[cs->top++];
 }
@@ -744,6 +746,9 @@ _hook_alloc(void *ud, void *ptr, size_t _osize, size_t _nsize) {
 
     if (oldsize == 0 && newsize > 0) {
         // 1、alloc
+        if (alloc_ret == NULL) {
+            return alloc_ret;
+        }
 
         struct callpath_node* leaf = _current_leaf_node(context);
         // 更新节点
@@ -843,6 +848,7 @@ _hook_call(lua_State* L, lua_Debug* far) {
             cs = (struct call_state*)pmalloc(sizeof(struct call_state) + sizeof(struct call_frame)*MAX_CALL_SIZE);
             cs->co = L; 
             cs->top = 0;
+            cs->skipped_call_depth = 0;
             cs->leave_time = 0;
             imap_set(context->cs_map, key, cs);
         }
@@ -864,6 +870,15 @@ _hook_call(lua_State* L, lua_Debug* far) {
     assert(cs->co == L);
 
     if (event == LUA_HOOKCALL || event == LUA_HOOKTAILCALL) {
+        if (cs->skipped_call_depth > 0) {
+            if (event == LUA_HOOKCALL) {
+                cs->skipped_call_depth++;
+            }
+            context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
+            context->running_in_hook = false;
+            return;
+        }
+
         struct call_frame* frame = NULL;
         struct icallpath_context* pre_callpath = NULL;
 
@@ -888,6 +903,12 @@ _hook_call(lua_State* L, lua_Debug* far) {
             old_frame->tail_pending = true;
             pre_callpath = old_frame->path;
             frame = push_callframe(cs);
+            if (frame == NULL) {
+                cs->skipped_call_depth = 1;
+                context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
+                context->running_in_hook = false;
+                return;
+            }
             frame->prototype = new_proto;
         } else {
             struct call_frame* pre_frame = cur_callframe(cs);
@@ -895,6 +916,12 @@ _hook_call(lua_State* L, lua_Debug* far) {
                 pre_callpath = pre_frame->path;
             }
             frame = push_callframe(cs);
+            if (frame == NULL) {
+                cs->skipped_call_depth = 1;
+                context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
+                context->running_in_hook = false;
+                return;
+            }
             frame->prototype = _get_prototype(L, far);
         }
 
@@ -909,6 +936,21 @@ _hook_call(lua_State* L, lua_Debug* far) {
         }
 
     } else if (event == LUA_HOOKRET) {
+        if (cs->skipped_call_depth > 0) {
+            cs->skipped_call_depth--;
+            if (cs->skipped_call_depth == 0) {
+                while (cs->top > 0) {
+                    struct call_frame* pre_frame = cur_callframe(cs);
+                    if (!pre_frame->tail_pending) break;
+                    struct call_frame* cur_frame = pop_callframe(cs);
+                    settle_frame_on_return(cur_frame, begin_time);
+                }
+            }
+            context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
+            context->running_in_hook = false;
+            return;
+        }
+
         if (cs->top <= 0) {
             context->profiler_cpu_cost_total += safe_u64_minus(get_mono_ns(), begin_time);
             context->running_in_hook = false;

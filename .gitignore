@@ -4,6 +4,8 @@
 *.dSYM
 .cache/
 .cursor/
+tests/.build-core-safety/
+tests/.build-functional-profile/
 
 compile_commands.json
 example/output_of_example.json
