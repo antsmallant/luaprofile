@@ -43,6 +43,18 @@ Run only deterministic trust workloads:
 bash tests/run_trust_workloads.sh
 ```
 
+Run the profiler overhead benchmark smoke profile:
+
+```bash
+bash tests/run_overhead_benchmark.sh smoke
+```
+
+Run the longer local overhead benchmark profile:
+
+```bash
+bash tests/run_overhead_benchmark.sh extended
+```
+
 Run the example after building:
 
 ```bash
