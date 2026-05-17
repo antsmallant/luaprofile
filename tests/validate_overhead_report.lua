@@ -42,6 +42,9 @@ assert_type(report, "table", "report")
 assert_field(report, "schema_version", "number", "report")
 assert_field(report, "kind", "string", "report")
 assert_field(report, "profile", "string", "report")
+if report.workload_set ~= nil then
+    assert_type(report.workload_set, "string", "report.workload_set")
+end
 assert_field(report, "generated_at", "string", "report")
 assert_field(report, "config", "table", "report")
 assert_field(report, "environment", "table", "report")
@@ -85,7 +88,9 @@ end
 for wi, workload in ipairs(report.workloads) do
     local workload_path = ("report.workloads[%d]"):format(wi)
     assert_field(workload, "name", "string", workload_path)
-    assert_number(workload.scale, workload_path .. ".scale")
+    if type(workload.scale) ~= "number" and type(workload.scale) ~= "table" then
+        fail(workload_path .. ".scale", "expected number or table")
+    end
     assert_field(workload, "modes", "table", workload_path)
 
     local seen_modes = {}

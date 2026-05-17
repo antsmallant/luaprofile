@@ -7,5 +7,6 @@ bash "$ROOT_DIR/tests/test_core_safety.sh"
 bash "$ROOT_DIR/tests/test_functional_profile.sh"
 bash "$ROOT_DIR/tests/run_trust_workloads.sh"
 bash "$ROOT_DIR/tests/run_overhead_benchmark.sh" smoke
+bash "$ROOT_DIR/tests/run_real_world_workloads.sh" smoke
 
 echo "all tests passed"

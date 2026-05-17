@@ -49,10 +49,28 @@ Run the profiler overhead benchmark smoke profile:
 bash tests/run_overhead_benchmark.sh smoke
 ```
 
+Run the overhead benchmark against real-world workloads:
+
+```bash
+bash tests/run_overhead_benchmark.sh smoke real_world
+```
+
 Run the longer local overhead benchmark profile:
 
 ```bash
 bash tests/run_overhead_benchmark.sh extended
+```
+
+Run real-world style workload smoke profiles:
+
+```bash
+bash tests/run_real_world_workloads.sh smoke
+```
+
+Run longer local real-world style workload profiles:
+
+```bash
+bash tests/run_real_world_workloads.sh extended
 ```
 
 Run the example after building:

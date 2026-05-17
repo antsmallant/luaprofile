@@ -1,8 +1,10 @@
-local build_dir = assert(arg[1], "usage: lua overhead_benchmark.lua <build_dir> <root_dir> <report_file> [smoke|extended]")
-local root_dir = assert(arg[2], "usage: lua overhead_benchmark.lua <build_dir> <root_dir> <report_file> [smoke|extended]")
-local report_file = assert(arg[3], "usage: lua overhead_benchmark.lua <build_dir> <root_dir> <report_file> [smoke|extended]")
+local build_dir = assert(arg[1], "usage: lua overhead_benchmark.lua <build_dir> <root_dir> <report_file> [smoke|extended] [focused|real_world]")
+local root_dir = assert(arg[2], "usage: lua overhead_benchmark.lua <build_dir> <root_dir> <report_file> [smoke|extended] [focused|real_world]")
+local report_file = assert(arg[3], "usage: lua overhead_benchmark.lua <build_dir> <root_dir> <report_file> [smoke|extended] [focused|real_world]")
 local profile = arg[4] or "smoke"
+local workload_set = arg[5] or "focused"
 assert(profile == "smoke" or profile == "extended", "profile must be smoke or extended")
+assert(workload_set == "focused" or workload_set == "real_world", "workload_set must be focused or real_world")
 
 package.path = root_dir .. "/?.lua;" .. root_dir .. "/example/?.lua;" .. package.path
 package.cpath = build_dir .. "/?.so;" .. package.cpath
@@ -11,6 +13,7 @@ local lpaux = require "luaprofileaux"
 local core = require "luaprofilecore"
 local json = require "json"
 local schema = require "tests.assertions.profile_schema"
+local real_world = require "tests.workloads.real_world"
 
 local profiles = {
     smoke = {
@@ -186,7 +189,7 @@ local function workload_serialization_traversal(n)
     return traverse(make_serialized_rows(n))
 end
 
-local workloads = {
+local focused_workloads = {
     {
         name = "function_call_rate",
         scale_key = "function_call_rate",
@@ -209,6 +212,33 @@ local workloads = {
     },
 }
 
+local function build_workloads()
+    if workload_set == "focused" then
+        local result = {}
+        for _, workload in ipairs(focused_workloads) do
+            result[#result + 1] = {
+                name = workload.name,
+                scale = config.scale[workload.scale_key],
+                run = workload.run,
+            }
+        end
+        return result
+    end
+
+    local scales = real_world.profiles[profile]
+    local result = {}
+    for _, workload in ipairs(real_world.workloads) do
+        result[#result + 1] = {
+            name = "real_world_" .. workload.name,
+            scale = scales[workload.name],
+            run = workload.run,
+        }
+    end
+    return result
+end
+
+local workloads = build_workloads()
+
 local function run_once(workload, mode)
     collectgarbage("collect")
 
@@ -220,7 +250,7 @@ local function run_once(workload, mode)
     end
 
     local begin_ns = now_ns()
-    local ok, workload_result = pcall(workload.run, config.scale[workload.scale_key])
+    local ok, workload_result = pcall(workload.run, workload.scale)
     local end_ns = now_ns()
 
     if started then
@@ -269,6 +299,7 @@ local function benchmark()
         schema_version = 1,
         kind = "luaprofile-overhead-benchmark",
         profile = profile,
+        workload_set = workload_set,
         generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         config = {
             warmup = config.warmup,
@@ -290,7 +321,7 @@ local function benchmark()
     for _, workload in ipairs(workloads) do
         local workload_report = {
             name = workload.name,
-            scale = config.scale[workload.scale_key],
+            scale = workload.scale,
             modes = {},
         }
 
