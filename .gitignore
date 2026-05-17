@@ -8,6 +8,7 @@ tests/.build-core-safety/
 tests/.build-functional-profile/
 tests/.build-trust-workloads/
 tests/.build-overhead-benchmark/
+tests/.build-real-world-workloads/
 
 compile_commands.json
 example/output_of_example.json
