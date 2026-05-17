@@ -6,6 +6,7 @@ package.path = root_dir .. "/?.lua;" .. root_dir .. "/example/?.lua;" .. package
 package.cpath = build_dir .. "/?.so;" .. package.cpath
 
 local lpaux = require "luaprofileaux"
+local profile_schema = require "tests.assertions.profile_schema"
 
 local original_create = coroutine.create
 local original_wrap = coroutine.wrap
@@ -91,46 +92,6 @@ local function collect_totals(root)
     return result
 end
 
-local function assert_result_shape(result)
-    assertf(type(result) == "table", "stop should return profile result table")
-    assertf(type(result.start_time) == "string", "result should include start_time")
-    assertf(result.start_time:match("^%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d$") ~= nil,
-        "start_time should use YYYY-MM-DD HH:MM:SS format, got %s", tostring(result.start_time))
-    assertf(type(result.duration_seconds) == "number", "result should include duration_seconds")
-    assertf(result.duration_seconds >= 0, "duration_seconds should be non-negative")
-    assertf(type(result.nodes) == "table", "result should include root nodes table")
-    assertf(result.nodes.name == "root root:0", "root node name should be stable, got %s", tostring(result.nodes.name))
-    assertf(type(result.nodes.children) == "table", "root node should include children")
-    assertf(type(result.nodes["cpu_cost_raw(ns)"]) == "number", "root should expose raw cpu cost")
-    assertf(type(result.nodes["cpu_cost_real(ns)"]) == "number", "root should expose real cpu cost")
-    assertf(type(result.nodes["cpu_cost_raw(%)"]) == "string", "root should expose raw cpu percent")
-    assertf(type(result.nodes["cpu_cost_real(%)"]) == "string", "root should expose real cpu percent")
-    assertf(type(result.nodes.cpu_call_count_total) == "number", "root should expose total call count")
-    assertf(type(result.nodes["profiler_cpu_cost_total(ns)"]) == "number", "root should expose profiler overhead")
-    assertf(type(result.nodes["avg_profiler_cost_per_call(ns)"]) == "number", "root should expose average profiler overhead")
-end
-
-local function assert_mem_fields_absent(root)
-    walk(root, function(node)
-        assertf(node.alloc_times == nil, "mem_profile off should not export alloc_times on %s", tostring(node.name))
-        assertf(node.alloc_bytes == nil, "mem_profile off should not export alloc_bytes on %s", tostring(node.name))
-        assertf(node.free_times == nil, "mem_profile off should not export free_times on %s", tostring(node.name))
-        assertf(node.free_bytes == nil, "mem_profile off should not export free_bytes on %s", tostring(node.name))
-        assertf(node.inuse_bytes == nil, "mem_profile off should not export inuse_bytes on %s", tostring(node.name))
-    end)
-end
-
-local function assert_mem_fields_present(root)
-    walk(root, function(node)
-        assertf(type(node.alloc_times) == "number", "mem_profile on should export alloc_times on %s", tostring(node.name))
-        assertf(type(node.alloc_bytes) == "number", "mem_profile on should export alloc_bytes on %s", tostring(node.name))
-        assertf(type(node.free_times) == "number", "mem_profile on should export free_times on %s", tostring(node.name))
-        assertf(type(node.free_bytes) == "number", "mem_profile on should export free_bytes on %s", tostring(node.name))
-        assertf(type(node.realloc_times) == "number", "mem_profile on should export realloc_times on %s", tostring(node.name))
-        assertf(type(node.inuse_bytes) == "number", "mem_profile on should export inuse_bytes on %s", tostring(node.name))
-    end)
-end
-
 local function run_profile(opts, body)
     assertf(coroutine.create == original_create, "coroutine.create should be restored before start")
     assertf(coroutine.wrap == original_wrap, "coroutine.wrap should be restored before start")
@@ -149,7 +110,7 @@ local function run_profile(opts, body)
         error(body_result, 0)
     end
 
-    assert_result_shape(result)
+    profile_schema.assert_result(result, opts)
     return result, body_result
 end
 
@@ -281,7 +242,6 @@ function tests.cpu_profile_without_mem_fields()
     local root = result.nodes
     local stat = collect_totals(root)
 
-    assert_mem_fields_absent(root)
     assertf(stat.nodes >= 6, "cpu profile should contain multiple nodes, got %d", stat.nodes)
     assertf(stat.call_count > 20, "cpu profile should record call counts, got %d", stat.call_count)
     assertf(stat.cpu_cost_raw > 0, "cpu profile should record raw cost")
@@ -302,7 +262,6 @@ function tests.mem_profile_tracks_alloc_free_and_exports_fields()
     local root = result.nodes
     local stat = collect_totals(root)
 
-    assert_mem_fields_present(root)
     assertf(stat.alloc_times > 0, "mem profile should record allocation count")
     assertf(stat.alloc_bytes > 0, "mem profile should record allocation bytes")
     assertf(stat.free_times > 0, "mem profile should record free count after GC")
@@ -319,7 +278,6 @@ function tests.aux_marks_coroutines_created_after_start()
     end)
 
     local root = result.nodes
-    assert_mem_fields_absent(root)
     assertf(find_node(root, "scenario_coroutine_switch"), "missing coroutine.create scenario node")
     assertf(find_node(root, "scenario_coroutine_wrap"), "missing coroutine.wrap scenario node")
     assertf(find_node(root, "yield"), "coroutine.create scenario should record yielded coroutine work")
@@ -336,7 +294,6 @@ function tests.tailcall_paths_are_profiled()
     local root = result.nodes
     local stat = collect_totals(root)
 
-    assert_mem_fields_absent(root)
     assertf(stat.call_count > 100, "tailcall profile should record repeated calls, got %d", stat.call_count)
     assertf(find_node(root, "scenario_tailcall"), "missing self-tailcall scenario node")
     assertf(find_node(root, "scenario_tailcall_fgh"), "missing f/g/h tailcall scenario node")
@@ -357,7 +314,6 @@ function tests.mem_profile_can_run_with_mixed_example_scenarios()
     local root = result.nodes
     local stat = collect_totals(root)
 
-    assert_mem_fields_present(root)
     assertf(stat.nodes > 10, "mixed profile should contain many call nodes, got %d", stat.nodes)
     assertf(stat.call_count > 100, "mixed profile should record many calls, got %d", stat.call_count)
     assertf(stat.alloc_times > 0, "mixed mem profile should record allocation count")

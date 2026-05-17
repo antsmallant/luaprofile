@@ -46,6 +46,12 @@ sh run_example.sh
 
 Expected example output: `example/output_of_example.json`.
 
+Validate generated profile JSON against the documented schema:
+
+```bash
+3rd/lua-5.4.8/src/lua tests/validate_profile_schema.lua example/output_of_example.json off
+```
+
 ## Current Harness Priorities
 
 The first project phase is to make profiler results trustworthy before doing profiler core refactors. Prioritize:
