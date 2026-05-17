@@ -37,6 +37,12 @@ Run the full current test suite:
 bash tests/run_all_tests.sh
 ```
 
+Run only deterministic trust workloads:
+
+```bash
+bash tests/run_trust_workloads.sh
+```
+
 Run the example after building:
 
 ```bash
