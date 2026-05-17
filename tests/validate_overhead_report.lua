@@ -48,6 +48,18 @@ assert_field(report, "environment", "table", "report")
 assert_field(report, "workloads", "table", "report")
 assert_field(report, "warnings", "table", "report")
 
+for i, warning in ipairs(report.warnings) do
+    local warning_path = ("report.warnings[%d]"):format(i)
+    assert_type(warning, "table", warning_path)
+    assert_field(warning, "workload", "string", warning_path)
+    assert_field(warning, "mode", "string", warning_path)
+    assert_field(warning, "code", "string", warning_path)
+    assert_field(warning, "message", "string", warning_path)
+    if warning.data ~= nil then
+        assert_type(warning.data, "table", warning_path .. ".data")
+    end
+end
+
 local required_modes = {
     no_profiler = true,
     cpu_profiler = true,
