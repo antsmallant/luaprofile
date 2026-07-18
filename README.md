@@ -1,3 +1,6 @@
+# Update
+这种 tracing 的方式做 profile 本身会有很大的消耗，导致结果很不准确，所以更推荐用 sampling 的方式来做，可参考这个项目： https://github.com/antsmallant/luaprof 。
+
 # About
 
 参考自 https://github.com/lsg2020/luaprofile ，原始版本是 https://github.com/lvzixun/luaprofile  。  
